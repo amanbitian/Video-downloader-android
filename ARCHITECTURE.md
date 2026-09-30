@@ -73,6 +73,22 @@ Fetch is organised around a clean separation between the **Browser**, the **Medi
 * **`BrowserScreen`** is the Compose UI: address bar, progress bar, navigation toolbar, home page, tab switcher, bookmarks/history dialog, link menu.
 * **`UrlUtils`**: address normalisation, URL extraction from shared text, host parsing, source blocklist, request pre-filter.
 
+### 2b. Primary-video detection (`browser/PageMediaScanner`, `detection/`, `adblock/`)
+```
+navigation → PageSession ─┬─ DOM/metadata scan (0 s, +1 s, +3.5 s, after SPA URL changes, after new media requests)
+                          ├─ network signals (pages + service workers, one pipeline; optional RequestBlocker first)
+                          └─ resolver results (HLS/DASH → qualities)
+                                        ↓
+ DownloadCoordinator.raw (every detection, all tagged with the session)  →  isReady()  →  PrimaryMediaResolver.select()
+                                        ↓                                              (score, reject ads/related/hidden)
+                              candidates (what the UI shows) → 48 dp button → compact sheet → enqueue snapshot
+```
+* **`PageMediaScanner`** — one read-only `evaluateJavascript` returning JSON; **`PageMediaSnapshot`** parses it (og:video, JSON-LD, elements with rect/visibility/context words/duration).
+* **`AdMediaClassifier`** (always on) and **`RequestBlocker`/`AdRules`** (optional, per-site exceptions in `AppSettings`) are independent.
+* **`PrimaryMediaResolver`** scores each candidate and picks the page's video(s); **`FilenameResolver`** names it. Candidates carry `signals` (network / DOM element / og:video / JSON-LD) that are merged when the same file is seen by several routes.
+* Only candidates whose lookups have finished are shown, so the button never opens an empty sheet. Late results are committed only if their `PageSession` is still current, under the same lock (regression-tested).
+* Started downloads are a snapshot in the persisted download list; navigating away has no effect on them.
+
 ### 3. Media Discovery (`BrowserController` → `DownloadCoordinator`, `HlsResolver`, `MediaProbe`)
 * Each visible page gets a **session**; media reported for an old page, a background tab or the page just left is dropped.
 * **Sources:** URL-sniffed sub-resources; the injected `<video>`/`<audio>` script (`FetchMedia` bridge); `Range: bytes=0-` requests confirmed by `MediaProbe`; explicit downloads from `DownloadListener` or the long-press menu.

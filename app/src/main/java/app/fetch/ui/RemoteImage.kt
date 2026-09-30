@@ -4,8 +4,11 @@ import android.graphics.BitmapFactory
 import android.util.LruCache
 import androidx.compose.foundation.Image
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.produceState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -21,9 +24,11 @@ private val cache = LruCache<String, ImageBitmap>(24)
 /** Small preview image (og:image, video poster). Downsampled, size-capped, cached; renders nothing until loaded or on failure. */
 @Composable
 fun RemoteImage(url: String?, modifier: Modifier = Modifier, maxPixels: Int = 480) {
-    val image by produceState(cache.get(url.orEmpty()), url) {
-        if (url == null || value != null) return@produceState
-        value = withContext(Dispatchers.IO) { runCatching { load(url, maxPixels) }.getOrNull() }?.also { cache.put(url, it) }
+    var image by remember(url) { mutableStateOf(url?.let { cache.get(it) }) }
+    LaunchedEffect(url) {
+        if (url != null && image == null) {
+            image = withContext(Dispatchers.IO) { runCatching { load(url, maxPixels) }.getOrNull() }?.also { cache.put(url, it) }
+        }
     }
     image?.let { Image(it, contentDescription = null, contentScale = ContentScale.Crop, modifier = modifier) }
 }

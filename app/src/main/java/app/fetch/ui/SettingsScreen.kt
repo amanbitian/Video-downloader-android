@@ -2,6 +2,9 @@ package app.fetch.ui
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.windowInsetsBottomHeight
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -11,7 +14,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SegmentedButton
@@ -20,7 +22,6 @@ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -36,16 +37,14 @@ import app.fetch.BuildConfig
 import app.fetch.settings.AppSettings
 import app.fetch.settings.ThemeMode
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(onClearBrowsingData: () -> Unit) {
+fun SettingsScreen(onBack: () -> Unit, onClearBrowsingData: () -> Unit) {
     val settings by AppSettings.values.collectAsStateWithLifecycle()
     var confirmClear by remember { mutableStateOf(false) }
     var cleared by remember { mutableStateOf(false) }
 
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-        TopAppBar(title = { Text("Settings", fontWeight = FontWeight.SemiBold) })
-
+    ScreenFrame(title = "Settings", onBack = onBack) {
+      Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         SectionHeader("Downloads")
         SettingBlock("Simultaneous downloads", "Applies to downloads started after the current ones finish") {
             SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
@@ -61,7 +60,7 @@ fun SettingsScreen(onClearBrowsingData: () -> Unit) {
         SwitchLine("Download over Wi-Fi only", "Pause instead of using mobile data", settings.wifiOnly) { checked ->
             AppSettings.update { it.copy(wifiOnly = checked) }
         }
-        InfoLine("Save location", "Videos → Movies/Fetch · Audio → Music/Fetch · Images → Pictures/Fetch · Other → Download/Fetch")
+        InfoLine("Save location", "Videos → Movies/Fetch · Audio → Music/Fetch · Other files → Download/Fetch")
 
         SectionHeader("Appearance")
         SettingBlock("Theme", null) {
@@ -77,6 +76,19 @@ fun SettingsScreen(onClearBrowsingData: () -> Unit) {
         }
 
         SectionHeader("Privacy")
+        SwitchLine("Block ads and trackers", "Known ad and tracking requests aren't loaded. Ads are never offered as downloads either way.", settings.blockAds) { checked ->
+            AppSettings.update { it.copy(blockAds = checked) }
+        }
+        if (settings.blockAds && settings.adAllowedSites.isNotEmpty()) {
+            Text("Sites allowed to show ads", fontWeight = FontWeight.Medium, modifier = Modifier.padding(start = 16.dp, top = 12.dp, end = 16.dp))
+            settings.adAllowedSites.sorted().forEach { site ->
+                Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(site, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                    TextButton(onClick = { AppSettings.update { it.copy(adAllowedSites = it.adAllowedSites - site) } }) { Text("Remove") }
+                }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        }
         InfoLine(
             "Clear browsing data",
             if (cleared) "Cookies, cache and history were cleared" else "Cookies, site storage, cache and history",
@@ -89,6 +101,8 @@ fun SettingsScreen(onClearBrowsingData: () -> Unit) {
             "Fetch only downloads direct, non-DRM media. YouTube is not supported. Respect content rights and each website's terms.",
             color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(16.dp)
         )
+        Spacer(Modifier.windowInsetsBottomHeight(WindowInsets.navigationBars))
+      }
     }
 
     if (confirmClear) {

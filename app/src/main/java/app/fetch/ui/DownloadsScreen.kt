@@ -4,6 +4,9 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -32,7 +35,6 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -42,11 +44,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -77,28 +78,28 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 private enum class DownloadFilter(val label: String, val kind: MediaKind?) {
-    ALL("All", null), VIDEO("Videos", MediaKind.VIDEO), AUDIO("Audio", MediaKind.AUDIO), IMAGE("Images", MediaKind.IMAGE), OTHER("Files", MediaKind.OTHER)
+    ALL("All", null), VIDEO("Videos", MediaKind.VIDEO), AUDIO("Audio", MediaKind.AUDIO), OTHER("Files", MediaKind.OTHER)
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DownloadsScreen(downloads: List<DownloadItem>) {
+fun DownloadsScreen(downloads: List<DownloadItem>, onBack: () -> Unit) {
     val context = LocalContext.current
     var filter by rememberSaveable { mutableStateOf(DownloadFilter.ALL) }
     var pendingDelete by remember { mutableStateOf<DownloadItem?>(null) }
     val kinds = remember(downloads) { downloads.associate { it.id to it.kind() } }
     val visible = downloads.filter { filter.kind == null || kinds[it.id] == filter.kind }
 
-    Column(Modifier.fillMaxSize()) {
-        TopAppBar(
-            title = { Text("Downloads", fontWeight = FontWeight.SemiBold) },
-            actions = {
-                if (downloads.any { it.phase == TransferPhase.COMPLETED || it.phase == TransferPhase.CANCELLED }) {
-                    IconButton(onClick = DownloadCoordinator::clearFinished) { Icon(Icons.Default.DeleteSweep, "Clear finished from list") }
-                }
+    ScreenFrame(
+        title = "Downloads",
+        onBack = onBack,
+        actions = {
+            if (downloads.any { it.phase == TransferPhase.COMPLETED || it.phase == TransferPhase.CANCELLED }) {
+                IconButton(onClick = DownloadCoordinator::clearFinished) { Icon(Icons.Default.DeleteSweep, "Clear finished from list") }
             }
-        )
-        Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        },
+    ) {
+      Column(Modifier.fillMaxSize()) {
+        Row(Modifier.padding(vertical = 8.dp).horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             DownloadFilter.entries.forEach { option ->
                 FilterChip(selected = filter == option, onClick = { filter = option }, label = { Text(option.label) })
             }
@@ -112,7 +113,7 @@ fun DownloadsScreen(downloads: List<DownloadItem>) {
                     Text("Play a video in the browser, then tap the download button.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
-        } else LazyColumn(Modifier.fillMaxSize()) {
+        } else LazyColumn(Modifier.fillMaxSize(), contentPadding = WindowInsets.navigationBars.asPaddingValues()) {
             items(visible, key = { it.id }) { item ->
                 DownloadRow(
                     item = item,
@@ -126,6 +127,7 @@ fun DownloadsScreen(downloads: List<DownloadItem>) {
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             }
         }
+      }
     }
 
     pendingDelete?.let { item ->
@@ -208,9 +210,11 @@ private fun RowMenu(onOpen: () -> Unit, onShare: () -> Unit, onRemove: () -> Uni
 @Composable
 private fun Thumbnail(item: DownloadItem, kind: MediaKind) {
     val context = LocalContext.current
-    val thumbnail by produceState<ImageBitmap?>(null, item.destination) {
-        value = if (item.destination == null || (kind != MediaKind.VIDEO && kind != MediaKind.IMAGE)) null
-        else withContext(Dispatchers.IO) { MediaActions.thumbnail(context, item, 192)?.asImageBitmap() }
+    var thumbnail by remember(item.destination) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(item.destination) {
+        if (item.destination != null && (kind == MediaKind.VIDEO || kind == MediaKind.IMAGE)) {
+            thumbnail = withContext(Dispatchers.IO) { MediaActions.thumbnail(context, item, 192)?.asImageBitmap() }
+        }
     }
     Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(8.dp), modifier = Modifier.size(56.dp)) {
         val image = thumbnail

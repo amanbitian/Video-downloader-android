@@ -1,5 +1,6 @@
 package app.fetch.download
 
+import app.fetch.detection.AdMediaClassifier
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
@@ -17,6 +18,7 @@ object HlsResolver {
 
     suspend fun resolve(candidate: MediaCandidate): ResolvedStream = withContext(Dispatchers.IO) {
         val body = fetchText(candidate.url, candidate.requestHeaders)
+        if (AdMediaClassifier.isVastDocument(body)) return@withContext ResolvedStream(emptyList(), "Advertisement", isAd = true)
         val variants = parse(candidate.url, body)
         if (variants.isEmpty()) {
             return@withContext ResolvedStream(emptyList(), if (isEncrypted(body)) "This stream is encrypted or protected and can't be downloaded." else "No downloadable quality found.")

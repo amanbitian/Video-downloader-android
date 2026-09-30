@@ -5,11 +5,13 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.os.Message
+import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
-import android.webkit.JavascriptInterface
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.ServiceWorkerClient
 import android.webkit.ServiceWorkerController
@@ -29,15 +31,23 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import app.fetch.BuildConfig
+import app.fetch.adblock.CosmeticFilter
+import app.fetch.adblock.RequestBlocker
+import app.fetch.adblock.RequestDecision
+import app.fetch.detection.MediaSignal
+import app.fetch.detection.PageMediaSnapshot
+import app.fetch.detection.PrimaryMediaResolver
 import app.fetch.download.DownloadCoordinator
+import app.fetch.settings.AppSettings
 import app.fetch.download.MediaCandidate
-import app.fetch.download.MediaFiles
 import app.fetch.download.MediaGrouping
 import app.fetch.download.StreamType
 import org.json.JSONArray
-import org.json.JSONObject
-import java.net.URL
 import java.util.UUID
+import java.io.ByteArrayInputStream
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 @Stable
@@ -52,13 +62,22 @@ class BrowserTab(val id: String, url: String, title: String) {
     var showingHome by mutableStateOf(url.isBlank())
     /** Bumped when the renderer died and the WebView had to be replaced. */
     var generation by mutableIntStateOf(0)
+    /** The browser bar is shown; it hides while the user scrolls down through the page. */
+    var barVisible by mutableStateOf(true)
+    internal var scrollTravel = 0
 
     // Read from WebView worker threads (shouldInterceptRequest, JS bridge), where Compose state must not be touched.
     internal val pageUrl = AtomicReference(url)
+    /** Host of [pageUrl] (lower-case, no "www."), kept alongside it so the request blocker never re-parses the page URL. */
+    @Volatile internal var pageHost: String = UrlUtils.host(url)
     internal val pageTitle = AtomicReference("")
     @Volatile internal var sessionId = -1L
     @Volatile internal var userAgent = ""
     internal var sessionUrl: String? = null
+    /** Requests refused by the ad/tracker blocker on this page. */
+    internal val blockedRequests = AtomicInteger(0)
+    /** A debounced rescan is already queued (set from worker threads). */
+    internal val scanPending = AtomicBoolean(false)
     /** The page just left. A media document (e.g. a bare .mp4) keeps fetching itself briefly after navigation. */
     @Volatile internal var previousPageUrl: String? = null
     /** Loaded when the tab's WebView is first created; tabs restored from disk load lazily. */
@@ -81,6 +100,7 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
 
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
     private var pendingPageFocus = false
+    private val mainHandler = Handler(Looper.getMainLooper())
     /** The visible tab, for callbacks on worker threads (service worker) that can't read Compose state. */
     private val activeTabRef = AtomicReference<BrowserTab?>(null)
     private val webViews = HashMap<String, WebView>()
@@ -97,13 +117,13 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
         activeTabId = tabs.firstOrNull { it.id == activeId }?.id ?: tabs.first().id
         activeTabRef.set(activeTab)
         startSession(activeTab)
+        // Lets chrome://inspect attach to pages in debug builds only.
+        if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
         // Media fetched by a site's service worker never reaches a WebViewClient; route it into the same pipeline.
         runCatching {
             ServiceWorkerController.getInstance().setServiceWorkerClient(object : ServiceWorkerClient() {
-                override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? {
+                override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? =
                     activeTabRef.get()?.let { intercept(it, request) }
-                    return null
-                }
             })
         }
     }
@@ -145,7 +165,7 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
         activeTabRef.set(tab)
         webViews[id]?.onResume()
         startSession(tab)
-        webViews[id]?.evaluateJavascript(RESCAN_SCRIPT, null)
+        scheduleScan(tab, 0)
         persist()
     }
 
@@ -216,11 +236,23 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
         callback?.onCustomViewHidden()
     }
 
-    /** "Download link/image" from the long-press menu. */
+    /** "Download link" from the long-press menu. Images are not offered: photos are never downloads. */
     fun downloadLink(menu: LinkMenu) {
-        val mime = if (menu.isImage) MediaFiles.resolveMime(StreamType.DIRECT, menu.url).takeIf { it.startsWith("image/") } ?: "image/jpeg" else null
-        report(activeTab, menu.url, mime, null, explicit = true, title = URLUtil.guessFileName(menu.url, null, mime))
+        if (menu.isImage) return
+        report(activeTab, menu.url, null, null, explicit = true, title = URLUtil.guessFileName(menu.url, null, null))
     }
+
+    /** Whether ads are allowed on the current site (a per-site exception to the blocker). */
+    val adsAllowedHere: Boolean
+        get() = isAllowedSite(UrlUtils.host(activeTab.url), AppSettings.values.value.adAllowedSites)
+
+    fun toggleAdsOnThisSite() {
+        val site = UrlUtils.registrableDomain(UrlUtils.host(activeTab.url)).ifBlank { return }
+        AppSettings.update { it.copy(adAllowedSites = if (site in it.adAllowedSites) it.adAllowedSites - site else it.adAllowedSites + site) }
+        webViews[activeTabId]?.reload()
+    }
+
+    private fun isAllowedSite(host: String, sites: Set<String>) = sites.any { host == it || host.endsWith(".$it") }
 
     fun clearBrowsingData() {
         CookieManager.getInstance().removeAllCookies(null)
@@ -257,32 +289,100 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
     private fun onNavigated(tab: BrowserTab, url: String) {
         tab.url = url
         tab.pageUrl.set(url)
+        tab.pageHost = UrlUtils.host(url)
         if (url.substringBefore('#') != tab.sessionUrl?.substringBefore('#')) {
             tab.previousPageUrl = tab.sessionUrl
             tab.pageTitle.set("")
+            tab.blockedRequests.set(0)
             startSession(tab)
         }
     }
 
-    /** One pipeline for page and service-worker requests, so the same file is never reported by two routes. */
-    private fun intercept(tab: BrowserTab, request: WebResourceRequest) {
-        if (request.isForMainFrame) return
-        val url = request.url.toString()
+    /**
+     * One pipeline for page and service-worker requests (so the same file is never reported by two routes). Runs on
+     * WebView worker threads: first the optional ad/tracker blocker, then media sniffing. Returns a response only to block.
+     */
+    private fun intercept(tab: BrowserTab, request: WebResourceRequest): WebResourceResponse? {
+        // Page loads themselves are never blocked or sniffed.
+        if (request.isForMainFrame) return null
+        val uri = request.url
+        val url = uri.toString()
+        val settings = AppSettings.values.value
+        if (settings.blockAds) {
+            // The page host is cached per tab and the request host comes from the already-parsed Uri: no URL parsing here.
+            val decision = RequestBlocker.classify(tab.pageHost, UrlUtils.normalizeHost(uri.host), url, isMainFrame = false, enabled = true, settings.adAllowedSites)
+            if (decision != RequestDecision.ALLOW) {
+                tab.blockedRequests.incrementAndGet()
+                return WebResourceResponse("text/plain", "utf-8", 204, "Blocked", emptyMap(), ByteArrayInputStream(EMPTY_BODY))
+            }
+        }
+        val kind = UrlUtils.classifyRequest(url)
+        if (kind == UrlUtils.RequestKind.STATIC) return null
         val headers = request.requestHeaders
         val range = headers?.entries?.firstOrNull { it.key.equals("Range", ignoreCase = true) }?.value
-        val slice = MediaGrouping.isSliceRequest(url, range)
-        if (UrlUtils.isCandidateUrl(url)) {
-            report(tab, url, null, headers, explicit = false, sliceFetch = slice)
-        } else if (!UrlUtils.isStaticAsset(url) && range?.startsWith("bytes=0-") == true) {
+        if (kind == UrlUtils.RequestKind.MEDIA) {
+            report(tab, url, null, headers, explicit = false, sliceFetch = MediaGrouping.isSliceRequest(url, range))
+            requestScanSoon(tab)
+        } else if (range?.startsWith("bytes=0-") == true) {
             // <video>/<audio> elements fetch with "Range: bytes=0-"; it is the only hint for extension-less media URLs.
-            report(tab, url, null, headers, explicit = false, probe = true, sliceFetch = slice)
+            report(tab, url, null, headers, explicit = false, probe = true, sliceFetch = MediaGrouping.isSliceRequest(url, range))
+            requestScanSoon(tab)
+        }
+        return null
+    }
+
+    /** Staged DOM/metadata scans. Players often appear after load, so look again shortly after — never by polling. */
+    private fun scheduleScan(tab: BrowserTab, delayMs: Long) {
+        val webView = webViews[tab.id] ?: return
+        val session = tab.sessionId
+        if (session <= 0) return
+        webView.postDelayed({ if (tab.sessionId == session && webViews[tab.id] === webView) runScan(tab, webView, session) }, delayMs)
+    }
+
+    /** Media just showed up on the network (e.g. the user pressed play); rescan once, debounced, to tie it to its player. */
+    private fun requestScanSoon(tab: BrowserTab) {
+        if (!tab.scanPending.compareAndSet(false, true)) return
+        mainHandler.postDelayed({ tab.scanPending.set(false); scheduleScan(tab, 0) }, NETWORK_RESCAN_DELAY_MS)
+    }
+
+    private fun runScan(tab: BrowserTab, webView: WebView, session: Long) {
+        webView.evaluateJavascript(PageMediaScanner.SCRIPT) { result ->
+            // Every result carries the session it was taken in; a scan of a page the user already left is dropped.
+            if (tab.sessionId != session) return@evaluateJavascript
+            val snapshot = PageMediaSnapshot.parse(decodeJsString(result))
+            if (snapshot == null) {
+                Log.w(TAG, "Page scan returned no data: ${result?.take(200)}")
+                return@evaluateJavascript
+            }
+            Log.d(TAG, "Page scan: ${snapshot.elements.size} media elements, ${snapshot.ogVideos.size} og:video, ${snapshot.structuredVideos.size} JSON-LD")
+            onSnapshot(tab, session, snapshot)
+        }
+    }
+
+    private fun onSnapshot(tab: BrowserTab, session: Long, snapshot: PageMediaSnapshot) {
+        val host = UrlUtils.host(snapshot.pageUrl)
+        val title = listOfNotNull(snapshot.ogTitle, snapshot.documentTitle).firstOrNull(::isUsableTitle)?.let { TitleNormalizer.clean(it, snapshot.siteName, host) }
+        title?.let(tab.pageTitle::set)
+        DownloadCoordinator.applyPageInfo(session, title, snapshot.ogImage)
+        DownloadCoordinator.applySnapshot(session, snapshot)
+        // Detect before playback: what the page declares, whether or not it has fetched it yet.
+        snapshot.elements.filter(PrimaryMediaResolver::isPlausiblePlayer).forEach { element ->
+            val group = element.key.takeIf { element.sources.size > 1 }?.let { "element:$session:$it" }
+            element.sources.forEach { source ->
+                report(tab, source, null, null, explicit = false, probe = true, thumbnailUrl = element.poster, groupKey = group,
+                    elementKey = element.key, signal = MediaSignal.DOM_ELEMENT)
+            }
+        }
+        snapshot.ogVideos.forEach { report(tab, it, null, null, explicit = false, probe = true, thumbnailUrl = snapshot.ogImage, signal = MediaSignal.OG_VIDEO) }
+        snapshot.structuredVideos.forEach { video ->
+            video.contentUrl?.let { report(tab, it, null, null, explicit = false, probe = true, thumbnailUrl = video.thumbnailUrl, signal = MediaSignal.STRUCTURED_DATA) }
         }
     }
 
     private fun report(
         tab: BrowserTab, url: String, mime: String?, requestHeaders: Map<String, String>?, explicit: Boolean,
         title: String? = null, sizeBytes: Long? = null, probe: Boolean = false, sliceFetch: Boolean = false, thumbnailUrl: String? = null,
-        groupKey: String? = null,
+        groupKey: String? = null, elementKey: String? = null, signal: MediaSignal = MediaSignal.NETWORK,
     ) {
         if (!url.startsWith("http", ignoreCase = true)) return
         if (!explicit && url == tab.previousPageUrl) return
@@ -297,6 +397,7 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
             url = url, title = title ?: tab.pageTitle.get().takeIf(::isUsableTitle) ?: fileName, mimeType = mime, streamType = streamType,
             requestHeaders = headersFor(tab, url, requestHeaders), pageUrl = tab.pageUrl.get(), explicit = explicit,
             probe = probe, sizeBytes = sizeBytes, sliceFetch = sliceFetch, thumbnailUrl = thumbnailUrl, groupKey = groupKey,
+            elementKey = elementKey, signals = setOf(signal),
         )
         if (explicit) DownloadCoordinator.detect(candidate) else DownloadCoordinator.detect(candidate, tab.sessionId)
     }
@@ -335,7 +436,6 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
         }
         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
         applyUserAgent(this, tab)
-        addJavascriptInterface(MediaBridge(tab), "FetchMedia")
         webChromeClient = ChromeClient(tab)
         webViewClient = Client(tab)
         setDownloadListener { url, userAgent, contentDisposition, mimeType, contentLength ->
@@ -345,7 +445,20 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
             if (copyBackForwardList().size == 0 && tabs.size > 1) post { closeTab(tab.id) }
         }
         setOnLongClickListener { onLongPress(this) }
+        setOnScrollChangeListener { _, _, scrollY, _, oldScrollY -> onPageScrolled(tab, scrollY, scrollY - oldScrollY) }
         tab.pendingUrl?.let { tab.pendingUrl = null; loadUrl(it) }
+    }
+
+    /**
+     * Hides the bar after a deliberate scroll down and brings it back on any clear scroll up or at the top, so reading
+     * gets the full screen. Travel is accumulated so small jitters and flings reversing by a few pixels don't flicker it.
+     */
+    private fun onPageScrolled(tab: BrowserTab, scrollY: Int, delta: Int) {
+        if (scrollY <= 0) { tab.barVisible = true; tab.scrollTravel = 0; return }
+        tab.scrollTravel = if ((delta > 0) == (tab.scrollTravel > 0)) tab.scrollTravel + delta else delta
+        val density = activity.resources.displayMetrics.density
+        if (tab.scrollTravel > HIDE_AFTER_DP * density) tab.barVisible = false
+        else if (tab.scrollTravel < -SHOW_AFTER_DP * density) tab.barVisible = true
     }
 
     private fun onLongPress(webView: WebView): Boolean {
@@ -372,16 +485,6 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
         tab.generation++
     }
 
-    /** Receives <video>/<audio> sources from the injected script; runs on a WebView binder thread. */
-    private inner class MediaBridge(private val tab: BrowserTab) {
-        @JavascriptInterface
-        fun onMedia(src: String?, poster: String?, elementKey: String?) {
-            val url = src?.takeIf { it.startsWith("http", ignoreCase = true) } ?: return
-            report(tab, url, null, null, explicit = false, probe = true, thumbnailUrl = poster?.takeIf { it.startsWith("http", ignoreCase = true) },
-                groupKey = elementKey?.ifBlank { null }?.let { "element:${tab.sessionId}:$it" })
-        }
-    }
-
     private inner class Client(private val tab: BrowserTab) : WebViewClient() {
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
             val scheme = request.url.scheme?.lowercase()
@@ -393,34 +496,30 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
 
         override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
             if (url != null) onNavigated(tab, url)
+            tab.barVisible = true
         }
 
         override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+            val before = tab.sessionId
             if (url != null) onNavigated(tab, url)
             tab.canGoBack = view.canGoBack()
             tab.canGoForward = view.canGoForward()
             if (!isReload && url != null) store.recordVisit(url, view.title.orEmpty())
+            // Single-page apps swap the video without a page load; the new content renders shortly after the URL changes.
+            if (tab.sessionId != before && tab.progress >= 100) SPA_SCAN_DELAYS_MS.forEach { scheduleScan(tab, it) }
         }
 
         override fun onPageFinished(view: WebView, url: String?) {
             tab.canGoBack = view.canGoBack()
             tab.canGoForward = view.canGoForward()
-            view.evaluateJavascript(PAGE_INFO_SCRIPT) { result ->
-                val info = runCatching { JSONObject(decodeJsString(result)) }.getOrNull() ?: return@evaluateJavascript
-                val page = tab.pageUrl.get()
-                val title = info.optString("title").takeIf(::isUsableTitle)?.let { TitleNormalizer.clean(it, info.optString("site").ifBlank { null }, UrlUtils.host(page)) }
-                val image = info.optString("image").ifBlank { null }?.let { runCatching { URL(URL(page), it).toString() }.getOrNull() }
-                title?.let(tab.pageTitle::set)
-                DownloadCoordinator.applyPageInfo(tab.sessionId, title, image)
-            }
-            view.evaluateJavascript(MEDIA_SCRIPT, null)
+            PAGE_SCAN_DELAYS_MS.forEach { scheduleScan(tab, it) }
+            // Blocked ads leave their reserved boxes behind; collapse them unless the user allowed ads on this site.
+            val settings = AppSettings.values.value
+            if (settings.blockAds && !isAllowedSite(tab.pageHost, settings.adAllowedSites)) view.evaluateJavascript(CosmeticFilter.SCRIPT, null)
             persist()
         }
 
-        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-            intercept(tab, request)
-            return null
-        }
+        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? = intercept(tab, request)
 
         override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail?): Boolean {
             onRendererGone(tab, view)
@@ -506,50 +605,13 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
         val WEB_SCHEMES = setOf("http", "https", "about", "data", "blob", "javascript")
         val DROPPED_HEADERS = setOf("range", "if-range", "if-none-match", "if-modified-since", "accept-encoding", "cookie")
         const val DESKTOP_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
-        /** Title, site name and preview image for naming downloads and showing a thumbnail in the sheet. */
-        val PAGE_INFO_SCRIPT = """
-            (() => {
-                const meta = (selector) => document.querySelector(selector)?.content || "";
-                const video = document.querySelector('video[poster]');
-                return JSON.stringify({
-                    title: meta('meta[property="og:title"]') || meta('meta[name="twitter:title"]') || document.title || "",
-                    site: meta('meta[property="og:site_name"]'),
-                    image: meta('meta[property="og:image"]') || meta('meta[name="twitter:image"]') || (video ? video.getAttribute('poster') : "")
-                });
-            })()
-        """.trimIndent()
-        /** Reports <video>/<audio> sources now and whenever one starts playing (lazy players, infinite feeds). */
-        val MEDIA_SCRIPT = """
-            (function() {
-                if (!window.FetchMedia) return;
-                function report(el) {
-                    try {
-                        var urls = [el.currentSrc, el.src];
-                        var sources = el.querySelectorAll ? el.querySelectorAll('source') : [];
-                        for (var i = 0; i < sources.length; i++) urls.push(sources[i].src);
-                        urls = urls.filter(function(u, k) { return u && /^https?:/i.test(u) && urls.indexOf(u) === k; });
-                        // Alternative <source> formats of one element are one video, not several.
-                        if (!el.__fetchKey) el.__fetchKey = 'v' + (window.__fetchSeq = (window.__fetchSeq || 0) + 1);
-                        var key = urls.length > 1 ? el.__fetchKey : "";
-                        for (var j = 0; j < urls.length; j++) FetchMedia.onMedia(urls[j], el.poster || "", key);
-                    } catch (e) {}
-                }
-                window.__fetchScanMedia = function() {
-                    var els = document.querySelectorAll('video,audio');
-                    for (var i = 0; i < els.length; i++) report(els[i]);
-                };
-                if (!window.__fetchMediaHooked) {
-                    window.__fetchMediaHooked = true;
-                    ['play', 'loadedmetadata'].forEach(function(type) {
-                        document.addEventListener(type, function(e) {
-                            var t = e.target;
-                            if (t && (t.tagName === 'VIDEO' || t.tagName === 'AUDIO')) report(t);
-                        }, true);
-                    });
-                }
-                window.__fetchScanMedia();
-            })();
-        """.trimIndent()
-        const val RESCAN_SCRIPT = "window.__fetchScanMedia && window.__fetchScanMedia();"
+        /** Right after load, then again for players that render late. */
+        val PAGE_SCAN_DELAYS_MS = longArrayOf(0L, 1_000L, 3_500L)
+        val SPA_SCAN_DELAYS_MS = longArrayOf(800L, 2_500L)
+        const val NETWORK_RESCAN_DELAY_MS = 700L
+        const val HIDE_AFTER_DP = 48
+        const val SHOW_AFTER_DP = 24
+        const val TAG = "FetchDetect"
+        val EMPTY_BODY = ByteArray(0)
     }
 }

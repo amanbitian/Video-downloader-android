@@ -8,7 +8,18 @@ object MediaProbe {
     data class Info(val mimeType: String?, val sizeBytes: Long?)
 
     fun probe(url: String, headers: Map<String, String>): Info? {
-        head(url, headers)?.let { return it }
+        // Some CDNs answer HEAD with a redirect to their homepage; only trust HEAD when it describes media.
+        val head = head(url, headers)
+        if (head != null && looksLikeMedia(head.mimeType)) return head
+        return runCatching { ranged(url, headers) }.getOrNull() ?: head
+    }
+
+    private fun looksLikeMedia(mime: String?): Boolean {
+        val m = mime?.substringBefore(';')?.trim()?.lowercase() ?: return false
+        return m.startsWith("video/") || m.startsWith("audio/") || m == "application/octet-stream" || "mpegurl" in m || "dash+xml" in m || m == "binary/octet-stream"
+    }
+
+    private fun ranged(url: String, headers: Map<String, String>): Info? {
         // Many CDNs reject HEAD; a one-byte ranged GET yields the same headers.
         val connection = open(url, headers, "GET").apply { setRequestProperty("Range", "bytes=0-0") }
         return try {

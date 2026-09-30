@@ -51,4 +51,6 @@ dependencies {
     implementation(libs.androidx.media3.ui)
     debugImplementation(libs.androidx.compose.ui.tooling)
     testImplementation(libs.junit)
+    // Real org.json for JVM tests; android.jar only ships stubs.
+    testImplementation(libs.orgjson)
 }

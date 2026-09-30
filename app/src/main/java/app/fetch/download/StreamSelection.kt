@@ -11,6 +11,8 @@ data class ResolvedStream(
     /** Directories holding only this stream's files (e.g. "./v720/"), for layouts whose file names aren't all known up front. */
     val claimedPrefixes: Set<String> = emptySet(),
     val durationSeconds: Double? = null,
+    /** The "manifest" was a VAST/VMAP ad document. */
+    val isAd: Boolean = false,
 )
 
 /** Codec families and which ones Android's MediaMuxer can put in one file together, without re-encoding. */

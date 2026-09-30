@@ -21,12 +21,35 @@ object UrlUtils {
     fun extractUrl(text: String?): String? =
         text?.let { urlPattern.find(it)?.value?.trimEnd('.', ',', ')', '!', '?', ';', ']') }
 
-    fun host(url: String?): String = url?.let { hostPattern.find(it)?.groupValues?.get(1)?.lowercase()?.removePrefix("www.") }.orEmpty()
+    /** "news.bbc.co.uk" → "bbc.co.uk", "m.youtube.com" → "youtube.com": the part a site owns. */
+    fun registrableDomain(host: String): String {
+        val labels = host.lowercase().removePrefix("www.").split('.').filter(String::isNotEmpty)
+        if (labels.size <= 2) return labels.joinToString(".")
+        val keep = if (labels.last().length == 2 && labels[labels.size - 2] in secondLevelLabels) 3 else 2
+        return labels.takeLast(keep).joinToString(".")
+    }
+
+    private val secondLevelLabels = setOf("co", "com", "org", "net", "ac", "gov", "edu", "or", "ne")
+
+    fun host(url: String?): String =url?.let { hostPattern.find(it)?.groupValues?.get(1)?.lowercase()?.removePrefix("www.") }.orEmpty()
 
     fun isBlockedSource(vararg urls: String?): Boolean = urls.any { url ->
         val host = host(url)
         host.isNotEmpty() && blockedHosts.any { host == it || host.endsWith(".$it") }
     }
+
+    enum class RequestKind { STATIC, MEDIA, OTHER }
+
+    /** One pass (one lower-casing) for the request hot path: static asset, media-looking, or anything else. */
+    fun classifyRequest(url: String): RequestKind {
+        val u = url.lowercase().substringBefore('#')
+        val path = u.substringBefore('?')
+        if (staticExtensions.any(path::endsWith) || u.contains("favicon") || u.contains("analytics")) return RequestKind.STATIC
+        return if (mediaHints.any(u::contains)) RequestKind.MEDIA else RequestKind.OTHER
+    }
+
+    /** Host as the blocker expects it (lower-case, no "www."), from an already-parsed URI host. */
+    fun normalizeHost(host: String?): String = host?.lowercase()?.removePrefix("www.").orEmpty()
 
     /** Images, scripts, styles, fonts and stream segments: never offered as downloads on their own. */
     fun isStaticAsset(url: String): Boolean {

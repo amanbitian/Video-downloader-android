@@ -6,9 +6,15 @@ import android.content.Context
 import android.content.Intent
 import android.view.ViewGroup
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -63,9 +69,8 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TextField
-import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
@@ -74,10 +79,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -86,6 +98,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import app.fetch.download.MediaCandidate
+import app.fetch.settings.AppSettings
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 private val Shortcuts = listOf(
     Bookmark("https://www.instagram.com", "Instagram"),
@@ -102,61 +116,67 @@ private val Shortcuts = listOf(
 fun BrowserScreen(
     controller: BrowserController,
     candidates: List<MediaCandidate>,
+    runningDownloads: Int,
     onOpenDownloadSheet: () -> Unit,
-    clipboardSuggestion: String?,
-    onClipboardSuggestionHandled: () -> Unit,
+    onOpenDownloads: () -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     val tab = controller.activeTab
     var showTabSwitcher by remember { mutableStateOf(false) }
     var showLibrary by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf(false) }
+    // The bar slides away while reading and returns on scroll up, on a new page, on the home page and while typing.
+    val barVisible = tab.showingHome || editing || tab.barVisible
 
-    Box(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize()) {
-            AddressBar(
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)) {
+        // The status bar stays reserved either way; only the bar itself collapses.
+        Spacer(Modifier.statusBarsPadding())
+        AnimatedVisibility(visible = barVisible, enter = expandVertically(), exit = shrinkVertically()) {
+            BrowserBar(
                 controller = controller,
                 tab = tab,
+                runningDownloads = runningDownloads,
+                editing = editing,
+                onEditingChange = { editing = it },
                 onShowTabs = { showTabSwitcher = true },
                 onShowLibrary = { showLibrary = true },
+                onOpenDownloads = onOpenDownloads,
+                onOpenSettings = onOpenSettings,
             )
-            if (!tab.showingHome && tab.progress in 1..99) {
-                LinearProgressIndicator(progress = { tab.progress / 100f }, modifier = Modifier.fillMaxWidth().height(2.dp))
-            } else Spacer(Modifier.height(2.dp))
-
-            Box(Modifier.weight(1f).fillMaxWidth()) {
-                if (tab.showingHome) {
-                    HomePage(
-                        bookmarks = controller.store.bookmarks,
-                        clipboardSuggestion = clipboardSuggestion,
-                        onOpen = { url -> controller.load(url); onClipboardSuggestionHandled() },
-                        onDismissSuggestion = onClipboardSuggestionHandled,
+        }
+        // Pages end above the system navigation bar (the keyboard padding above already covers it while typing).
+        Box(Modifier.weight(1f).fillMaxWidth().navigationBarsPadding()) {
+            if (tab.showingHome) {
+                HomePage(bookmarks = controller.store.bookmarks, onOpen = controller::load)
+            } else {
+                // One WebView per tab lives in the controller; this only attaches the active one.
+                key(tab.id, tab.generation) {
+                    AndroidView(
+                        factory = { controller.attach(tab) },
+                        modifier = Modifier.fillMaxSize(),
+                        onRelease = { (it.parent as? ViewGroup)?.removeView(it) },
                     )
-                } else {
-                    // One WebView per tab lives in the controller; this only attaches the active one.
-                    key(tab.id, tab.generation) {
-                        AndroidView(
-                            factory = { controller.attach(tab) },
-                            modifier = Modifier.fillMaxSize(),
-                            onRelease = { (it.parent as? ViewGroup)?.removeView(it) },
-                        )
-                    }
                 }
-                if (!tab.showingHome && clipboardSuggestion != null) {
-                    ClipboardBanner(clipboardSuggestion, onOpen = { controller.newTab(clipboardSuggestion); onClipboardSuggestionHandled() }, onDismiss = onClipboardSuggestionHandled)
-                }
-                if (candidates.isNotEmpty()) {
+            }
+            if (!tab.showingHome && tab.progress in 1..99) {
+                LinearProgressIndicator(progress = { tab.progress / 100f }, modifier = Modifier.fillMaxWidth().height(2.dp).align(Alignment.TopStart))
+            }
+            if (!tab.showingHome && candidates.isNotEmpty()) {
+                // Appears only once the page's primary video is resolved, so it never opens onto an empty sheet.
+                BadgedBox(
+                    badge = { if (candidates.size > 1) Badge { Text(candidates.size.toString()) } },
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+                ) {
                     FloatingActionButton(
                         onClick = onOpenDownloadSheet,
                         containerColor = MaterialTheme.colorScheme.primary,
-                        shape = RoundedCornerShape(16.dp),
-                        modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp)
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.size(48.dp),
                     ) {
-                        BadgedBox(badge = { if (candidates.size > 1) Badge { Text(candidates.size.toString()) } }) {
-                            Icon(Icons.Default.Download, contentDescription = "Download video")
-                        }
+                        Icon(Icons.Default.Download, contentDescription = "Download video", modifier = Modifier.size(22.dp))
                     }
                 }
             }
-            NavigationToolbar(controller, tab)
         }
     }
 
@@ -169,92 +189,148 @@ fun BrowserScreen(
     controller.linkMenu?.let { menu -> LinkMenuDialog(controller, menu) }
 }
 
+/**
+ * The browser's only bar: 44 dp holding the address, the tab count and the menu (plus a downloads badge while something
+ * downloads). Navigation lives in the menu's icon row and the system back gesture.
+ */
 @Composable
-private fun AddressBar(controller: BrowserController, tab: BrowserTab, onShowTabs: () -> Unit, onShowLibrary: () -> Unit) {
-    val focusManager = LocalFocusManager.current
-    val context = LocalContext.current
-    val shownUrl = if (tab.showingHome) "" else tab.url
-    var focused by remember { mutableStateOf(false) }
-    var input by remember(tab.id, shownUrl) { mutableStateOf(shownUrl) }
-    var menuOpen by remember { mutableStateOf(false) }
+private fun BrowserBar(
+    controller: BrowserController,
+    tab: BrowserTab,
+    runningDownloads: Int,
+    editing: Boolean,
+    onEditingChange: (Boolean) -> Unit,
+    onShowTabs: () -> Unit,
+    onShowLibrary: () -> Unit,
+    onOpenDownloads: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    Row(Modifier.fillMaxWidth().height(44.dp).padding(start = 8.dp, end = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.weight(1f).height(34.dp).clip(RoundedCornerShape(17.dp)).background(MaterialTheme.colorScheme.surfaceVariant)) {
+            if (editing) {
+                AddressEditor(tab, onLoad = { controller.load(it); onEditingChange(false); controller.focusPage() }, onDone = { onEditingChange(false) })
+            } else {
+                // Not a text field until tapped: nothing on screen can take keyboard focus or fire "Go" by itself.
+                Row(Modifier.fillMaxSize().clickable { onEditingChange(true) }.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    val secure = tab.url.startsWith("https://") && !tab.showingHome
+                    Icon(if (secure) Icons.Default.Lock else Icons.Default.Search, null, Modifier.size(14.dp), tint = muted)
+                    Spacer(Modifier.width(8.dp))
+                    val host = if (tab.showingHome) "" else UrlUtils.host(tab.url).ifBlank { tab.url }
+                    Text(host.ifBlank { "Search or enter address" }, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        color = if (host.isBlank()) muted else MaterialTheme.colorScheme.onSurface)
+                }
+            }
+        }
+        if (runningDownloads > 0) {
+            IconButton(onClick = onOpenDownloads, modifier = Modifier.size(40.dp)) {
+                BadgedBox(badge = { Badge { Text("$runningDownloads") } }) { Icon(Icons.Default.Download, "Downloads", Modifier.size(20.dp)) }
+            }
+        }
+        IconButton(onClick = onShowTabs, modifier = Modifier.size(40.dp)) {
+            Surface(shape = RoundedCornerShape(5.dp), color = Color.Transparent,
+                border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.onSurface), modifier = Modifier.size(19.dp)) {
+                // The counter is part of an icon: sized in dp so large system text can't overflow its 19 dp box.
+                val counterSize = with(LocalDensity.current) { 10.dp.toSp() }
+                Box(contentAlignment = Alignment.Center) { Text(controller.tabs.size.coerceAtMost(99).toString(), fontSize = counterSize, lineHeight = counterSize, fontWeight = FontWeight.Bold, maxLines = 1, softWrap = false) }
+            }
+        }
+        BrowserMenu(controller, tab, onShowLibrary, onOpenDownloads, onOpenSettings)
+    }
+}
 
-    Row(Modifier.statusBarsPadding().padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-        TextField(
-            value = if (focused) input else if (tab.showingHome) "" else UrlUtils.host(tab.url).ifBlank { tab.url },
-            onValueChange = { input = it },
-            modifier = Modifier.weight(1f).onFocusChanged { state ->
-                if (state.isFocused && !focused) input = shownUrl
-                focused = state.isFocused
+@Composable
+private fun AddressEditor(tab: BrowserTab, onLoad: (String) -> Unit, onDone: () -> Unit) {
+    val focusRequester = remember { FocusRequester() }
+    val initial = if (tab.showingHome) "" else tab.url
+    var value by remember { mutableStateOf(TextFieldValue(initial, TextRange(0, initial.length))) }
+    var hadFocus by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+    Row(Modifier.fillMaxSize().padding(start = 12.dp, end = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+        BasicTextField(
+            value = value,
+            onValueChange = { value = it },
+            modifier = Modifier.weight(1f).focusRequester(focusRequester).onFocusChanged { state ->
+                if (state.isFocused) hadFocus = true else if (hadFocus) onDone()
             },
             singleLine = true,
-            placeholder = { Text("Search or enter address") },
-            leadingIcon = { Icon(if (tab.url.startsWith("https://") && !tab.showingHome) Icons.Default.Lock else Icons.Default.Search, null, Modifier.size(18.dp)) },
-            trailingIcon = if (focused && input.isNotEmpty()) {
-                { IconButton(onClick = { input = "" }) { Icon(Icons.Default.Close, "Clear") } }
-            } else null,
+            textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface, fontSize = 14.sp),
+            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
-            keyboardActions = KeyboardActions(onGo = { controller.load(input); focusManager.clearFocus(); controller.focusPage() }),
-            shape = RoundedCornerShape(24.dp),
-            colors = TextFieldDefaults.colors(
-                focusedIndicatorColor = Color.Transparent,
-                unfocusedIndicatorColor = Color.Transparent,
-            ),
-        )
-        IconButton(onClick = onShowTabs) {
-            Surface(shape = RoundedCornerShape(5.dp), color = Color.Transparent,
-                border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.onSurface), modifier = Modifier.size(22.dp)) {
-                Box(contentAlignment = Alignment.Center) { Text(controller.tabs.size.coerceAtMost(99).toString(), fontSize = 11.sp, fontWeight = FontWeight.Bold) }
-            }
-        }
-        Box {
-            IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "Browser menu") }
-            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                DropdownMenuItem(text = { Text("New tab") }, onClick = { menuOpen = false; controller.newTab() })
-                DropdownMenuItem(text = { Text("Bookmarks & history") }, onClick = { menuOpen = false; onShowLibrary() })
-                if (!tab.showingHome && tab.url.isNotBlank()) {
-                    DropdownMenuItem(text = { Text("Share page") }, onClick = {
-                        menuOpen = false
-                        context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, tab.url), "Share"))
-                    })
-                    DropdownMenuItem(text = { Text("Copy link") }, onClick = { menuOpen = false; copyToClipboard(context, tab.url) })
+            keyboardActions = KeyboardActions(onGo = { if (value.text.isNotBlank()) onLoad(value.text) else onDone() }),
+            decorationBox = { inner ->
+                Box(contentAlignment = Alignment.CenterStart) {
+                    if (value.text.isEmpty()) Text("Search or enter address", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp, maxLines = 1)
+                    inner()
                 }
+            },
+        )
+        IconButton(onClick = { if (value.text.isEmpty()) onDone() else value = TextFieldValue("") }, modifier = Modifier.size(30.dp)) {
+            Icon(Icons.Default.Close, "Clear", Modifier.size(16.dp))
+        }
+    }
+}
+
+@Composable
+private fun BrowserMenu(controller: BrowserController, tab: BrowserTab, onShowLibrary: () -> Unit, onOpenDownloads: () -> Unit, onOpenSettings: () -> Unit) {
+    val context = LocalContext.current
+    var open by remember { mutableStateOf(false) }
+    val blockAds = AppSettings.values.collectAsStateWithLifecycle().value.blockAds
+    val onPage = !tab.showingHome && tab.url.isNotBlank()
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    fun act(action: () -> Unit) { open = false; action() }
+    Box {
+        IconButton(onClick = { open = true }, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.MoreVert, "Menu", Modifier.size(20.dp)) }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            // Navigation row, as in Chrome's menu: the page keeps the screen, the controls live here.
+            Row(Modifier.padding(horizontal = 4.dp)) {
+                IconButton(onClick = { act { controller.handleBack() } }, enabled = controller.canHandleBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
+                IconButton(onClick = { act(controller::goForward) }, enabled = onPage && tab.canGoForward) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "Forward") }
+                IconButton(onClick = { act(controller::reloadOrStop) }, enabled = onPage) {
+                    if (tab.progress < 100) Icon(Icons.Default.Close, "Stop loading") else Icon(Icons.Default.Refresh, "Reload")
+                }
+                val bookmarked = controller.store.isBookmarked(tab.url)
+                IconButton(onClick = { act(controller::toggleBookmark) }, enabled = onPage) {
+                    Icon(if (bookmarked) Icons.Default.Star else Icons.Default.StarBorder, if (bookmarked) "Remove bookmark" else "Add bookmark",
+                        tint = if (bookmarked) MaterialTheme.colorScheme.primary else LocalContentColor.current)
+                }
+                IconButton(onClick = { act(controller::goHome) }) { Icon(Icons.Default.Home, "Home") }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            DropdownMenuItem(text = { Text("New tab") }, onClick = { act { controller.newTab() } })
+            DropdownMenuItem(text = { Text("Downloads") }, onClick = { act(onOpenDownloads) })
+            DropdownMenuItem(text = { Text("Bookmarks & history") }, onClick = { act(onShowLibrary) })
+            if (onPage) {
+                DropdownMenuItem(text = { Text("Share page") }, onClick = {
+                    act { context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, tab.url), "Share")) }
+                })
+                DropdownMenuItem(text = { Text("Copy link") }, onClick = { act { copyToClipboard(context, tab.url) } })
+            }
+            DropdownMenuItem(
+                text = { Text("Desktop site") },
+                trailingIcon = { Checkbox(checked = tab.desktopMode, onCheckedChange = null) },
+                onClick = { act(controller::toggleDesktopMode) }
+            )
+            if (blockAds && onPage) {
                 DropdownMenuItem(
-                    text = { Text("Desktop site") },
-                    trailingIcon = { Checkbox(checked = tab.desktopMode, onCheckedChange = null) },
-                    onClick = { menuOpen = false; controller.toggleDesktopMode() }
+                    text = {
+                        Column {
+                            Text("Allow ads on this site")
+                            val blocked = tab.blockedRequests.get()
+                            if (blocked > 0 && !controller.adsAllowedHere) Text("$blocked ad/tracker ${if (blocked == 1) "request" else "requests"} blocked", fontSize = 12.sp, color = muted)
+                        }
+                    },
+                    trailingIcon = { Checkbox(checked = controller.adsAllowedHere, onCheckedChange = null) },
+                    onClick = { act(controller::toggleAdsOnThisSite) }
                 )
             }
+            DropdownMenuItem(text = { Text("Settings") }, onClick = { act(onOpenSettings) })
         }
     }
 }
 
 @Composable
-private fun NavigationToolbar(controller: BrowserController, tab: BrowserTab) {
-    val onPage = !tab.showingHome && tab.url.isNotBlank()
-    Surface(color = MaterialTheme.colorScheme.surface) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-            IconButton(onClick = { controller.handleBack() }, enabled = controller.canHandleBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
-            IconButton(onClick = controller::goForward, enabled = onPage && tab.canGoForward) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "Forward") }
-            IconButton(onClick = controller::reloadOrStop, enabled = onPage) {
-                if (tab.progress < 100) Icon(Icons.Default.Close, "Stop loading") else Icon(Icons.Default.Refresh, "Reload")
-            }
-            IconButton(onClick = controller::goHome) { Icon(Icons.Default.Home, "Home") }
-            val bookmarked = controller.store.isBookmarked(tab.url)
-            IconButton(onClick = controller::toggleBookmark, enabled = onPage) {
-                Icon(if (bookmarked) Icons.Default.Star else Icons.Default.StarBorder, if (bookmarked) "Remove bookmark" else "Add bookmark",
-                    tint = if (bookmarked) MaterialTheme.colorScheme.primary else LocalContentColor.current)
-            }
-        }
-    }
-}
-
-@Composable
-private fun HomePage(
-    bookmarks: List<Bookmark>,
-    clipboardSuggestion: String?,
-    onOpen: (String) -> Unit,
-    onDismissSuggestion: () -> Unit,
-) {
+private fun HomePage(bookmarks: List<Bookmark>, onOpen: (String) -> Unit) {
     val context = LocalContext.current
     val sites = (bookmarks + Shortcuts).distinctBy { UrlUtils.host(it.url) }.filterNot { UrlUtils.isBlockedSource(it.url) }
     LazyVerticalGrid(
@@ -273,27 +349,15 @@ private fun HomePage(
                     color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 20.sp
                 )
                 Spacer(Modifier.height(12.dp))
-                if (clipboardSuggestion != null) {
-                    Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(12.dp)) {
-                        Row(Modifier.padding(start = 14.dp, end = 4.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text("Copied link", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                                Text(clipboardSuggestion, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            }
-                            TextButton(onClick = { onOpen(clipboardSuggestion) }) { Text("Open") }
-                            IconButton(onClick = onDismissSuggestion) { Icon(Icons.Default.Close, "Dismiss") }
-                        }
-                    }
-                } else {
-                    OutlinedButton(onClick = {
-                        val clip = context.getSystemService(ClipboardManager::class.java)?.primaryClip
-                        val text = if (clip != null && clip.itemCount > 0) clip.getItemAt(0)?.coerceToText(context)?.toString() else null
-                        (UrlUtils.extractUrl(text) ?: text)?.takeIf { it.isNotBlank() }?.let(onOpen)
-                    }) {
-                        Icon(Icons.Default.ContentPaste, null, Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text("Paste link")
-                    }
+                // The clipboard is only read when the user taps: Android shows a "pasted from your clipboard" toast on every read.
+                OutlinedButton(onClick = {
+                    val clip = context.getSystemService(ClipboardManager::class.java)?.primaryClip
+                    val text = if (clip != null && clip.itemCount > 0) clip.getItemAt(0)?.coerceToText(context)?.toString() else null
+                    (UrlUtils.extractUrl(text) ?: text)?.takeIf { it.isNotBlank() }?.let(onOpen)
+                }) {
+                    Icon(Icons.Default.ContentPaste, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Paste link")
                 }
             }
         }
@@ -311,18 +375,6 @@ private fun SiteShortcut(site: Bookmark, onClick: () -> Unit) {
         }
         Spacer(Modifier.height(6.dp))
         Text(site.title, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-    }
-}
-
-@Composable
-private fun ClipboardBanner(url: String, onOpen: () -> Unit, onDismiss: () -> Unit) {
-    Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(12.dp), shadowElevation = 4.dp,
-        modifier = Modifier.fillMaxWidth().padding(12.dp)) {
-        Row(Modifier.padding(start = 14.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("Open copied link? $url", fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-            TextButton(onClick = onOpen) { Text("Open") }
-            IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, "Dismiss") }
-        }
     }
 }
 
@@ -420,7 +472,7 @@ private fun LinkMenuDialog(controller: BrowserController, menu: LinkMenu) {
             Column {
                 MenuAction("Open in new tab") { controller.newTab(menu.url); dismiss() }
                 MenuAction("Open in background tab") { controller.newTab(menu.url, select = false); dismiss() }
-                MenuAction(if (menu.isImage) "Download image" else "Download link") { controller.downloadLink(menu); dismiss() }
+                if (!menu.isImage) MenuAction("Download link") { controller.downloadLink(menu); dismiss() }
                 MenuAction("Copy link") { copyToClipboard(context, menu.url); dismiss() }
                 MenuAction("Share link") {
                     context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, menu.url), "Share"))

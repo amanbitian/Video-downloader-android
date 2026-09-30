@@ -18,23 +18,10 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.Badge
-import androidx.compose.material3.BadgedBox
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -190,35 +177,20 @@ private fun FetchApp(
     BackHandler(enabled = screen == SCREEN_BROWSE && browser.canHandleBack) { browser.handleBack() }
 
     Box(Modifier.fillMaxSize()) {
-        Scaffold(
-            containerColor = MaterialTheme.colorScheme.background,
-            // Each screen handles the status bar itself; the WebView must also shrink for the keyboard.
-            contentWindowInsets = WindowInsets(0),
-            bottomBar = {
-                NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
-                    NavigationBarItem(selected = screen == SCREEN_BROWSE, onClick = { onScreenChange(SCREEN_BROWSE) }, icon = { Icon(Icons.Default.Language, null) }, label = { Text("Browse") })
-                    val running = downloads.count { it.phase.isRunning }
-                    NavigationBarItem(
-                        selected = screen == SCREEN_DOWNLOADS, onClick = { onScreenChange(SCREEN_DOWNLOADS) },
-                        icon = { BadgedBox(badge = { if (running > 0) Badge { Text("$running") } }) { Icon(Icons.Default.Download, null) } },
-                        label = { Text("Downloads") }
-                    )
-                    NavigationBarItem(selected = screen == SCREEN_SETTINGS, onClick = { onScreenChange(SCREEN_SETTINGS) }, icon = { Icon(Icons.Default.Settings, null) }, label = { Text("Settings") })
-                }
-            }
-        ) { padding ->
-            Box(Modifier.padding(padding).consumeWindowInsets(padding).imePadding().fillMaxSize()) {
-                when (screen) {
-                    SCREEN_BROWSE -> BrowserScreen(
-                        controller = browser,
-                        candidates = candidates,
-                        onOpenDownloadSheet = { showDownloadSheet = true },
-                        clipboardSuggestion = clipboardSuggestion,
-                        onClipboardSuggestionHandled = onClipboardSuggestionHandled,
-                    )
-                    SCREEN_DOWNLOADS -> DownloadsScreen(downloads)
-                    else -> SettingsScreen(onClearBrowsingData = browser::clearBrowsingData)
-                }
+        // No bottom navigation bar: Downloads and Settings are reached from the browser's top bar and menu, and have a back arrow.
+        // Each screen draws under the system bars itself; the keyboard shrinks the whole page.
+        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).imePadding()) {
+            when (screen) {
+                SCREEN_BROWSE -> BrowserScreen(
+                    controller = browser,
+                    candidates = candidates,
+                    runningDownloads = downloads.count { it.phase.isRunning },
+                    onOpenDownloadSheet = { showDownloadSheet = true },
+                    onOpenDownloads = { onScreenChange(SCREEN_DOWNLOADS) },
+                    onOpenSettings = { onScreenChange(SCREEN_SETTINGS) },
+                )
+                SCREEN_DOWNLOADS -> DownloadsScreen(downloads, onBack = { onScreenChange(SCREEN_BROWSE) })
+                else -> SettingsScreen(onBack = { onScreenChange(SCREEN_BROWSE) }, onClearBrowsingData = browser::clearBrowsingData)
             }
         }
 
@@ -229,8 +201,8 @@ private fun FetchApp(
         DownloadBottomSheet(
             candidates = candidates,
             onDismiss = { showDownloadSheet = false },
-            onDownload = { candidate, variant ->
-                DownloadCoordinator.enqueue(context, candidate, variant)
+            onDownload = { candidate, variant, name ->
+                DownloadCoordinator.enqueue(context, candidate, variant, name)
                 showDownloadSheet = false
             }
         )

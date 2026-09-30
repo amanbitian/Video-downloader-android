@@ -12,9 +12,18 @@
 * **Fullscreen video**, pop-up windows opened by a tap (untapped pop-ups are blocked), file uploads, desktop-site mode.
 * **Long-press menu** on links and images: open in new/background tab, download, copy, share.
 * **Home page** with site shortcuts and bookmarks; **bookmarks & history**.
-* **Share links into Fetch** from any app, open http(s) links with it, and get offered a link you just copied.
+* **Share links into Fetch** from any app, or open http(s) links with it. "Paste link" on the home page reads the clipboard only when tapped (Android shows a system toast on every clipboard read).
+* **One minimal bar:** a single 44 dp top bar (address, tab count, menu; a downloads badge appears only while something downloads). It slides away while you scroll down and returns on scroll up, so pages get almost the whole screen. Back is the system gesture; forward, reload, bookmark and home are the icon row at the top of the menu. The address is plain text until tapped, so it can never take focus by itself. Downloads and Settings are full pages with a back arrow, centred in a 720 dp column on tablets and landscape. Checked on phone, small phone (360×640 dp), tablet (800×1280 dp), landscape and 130 % system text; lint reports no API-level issues for Android 10+.
 
-### 2. Media Discovery
+### 2. Finding "the" video on a page
+Fetch answers *"which video is this page about?"*, not *"what media did the page request?"*:
+* **Before playback:** one scoped DOM query (no JavaScript bridge) reads `og:video`, JSON-LD `VideoObject`, and every `<video>`/`<audio>` with its size, position, visibility and surroundings, right after load, again a second later, and after single-page-app navigations. The download button can appear without pressing play.
+* **Primary-video scoring (`PrimaryMediaResolver`):** page-declared video, the largest and most central visible player, a player that matches the stream's length, and multi-quality manifests score up; hidden or tiny players, silent looping previews, and anything in a *related / up-next / sidebar / carousel* container score down. Only confident winners are shown — one sure video beats a list of maybes; several genuine clips in an article are all offered.
+* **Ads:** VAST/VMAP documents, ad servers, ad-shaped paths and ad-slot players are never offered, whether or not the ad blocker is on. An optional blocker (Settings → Privacy, on by default) stops known ad/tracker requests (hash-set host lookups with a per-host cache, ~0.25 µs per request) and collapses the empty boxes pages reserve for blocked ads, with a per-site "Allow ads on this site" exception. Not covered: "native" ads a site serves from its own servers inside its feed (e.g. Reddit promoted posts) and a site's own "open in app" prompts.
+* **No photos:** images are never downloads (thumbnails are only used for display). Documents still download when you tap an explicit download link.
+* **Naming:** video metadata → page title (site suffixes removed) → never a CDN file name.
+
+### 2b. Media Discovery
 * Sniffs media requests (`.mp4`, `.webm`, `.m3u8`, `.mpd`, audio…) from pages **and service workers** through one pipeline, after a static-asset pre-filter.
 * **One video, several qualities:** HLS/DASH manifests become one entry with a row per resolution (codec, bitrate, `~size` from bitrate × duration). Files a manifest owns — its playlists, segments and byte-range slices fetched by streaming (MSE) players — are absorbed instead of listed as separate videos. Files named by quality (`clip_480p.mp4`, `clip_1080p.mp4`) and alternative `<source>` formats of one `<video>` are grouped the same way.
 * **Page isolation:** every page is a session; lookups for the previous page are cancelled, and any result that still arrives is committed only if its session is current (checked under the state lock).

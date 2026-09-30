@@ -1,5 +1,6 @@
 package app.fetch.download
 
+import app.fetch.detection.AdMediaClassifier
 import org.w3c.dom.Element
 import java.io.ByteArrayInputStream
 import java.net.URL
@@ -182,6 +183,7 @@ data class DashManifest(val durationSeconds: Double?, val isLive: Boolean, val p
 object DashResolver {
     suspend fun resolve(candidate: MediaCandidate): ResolvedStream {
         val xml = HlsResolver.fetchText(candidate.url, candidate.requestHeaders)
+        if (AdMediaClassifier.isVastDocument(xml)) return ResolvedStream(emptyList(), "Advertisement", isAd = true)
         return build(candidate.url, DashManifest.parse(candidate.url, xml))
     }
 

@@ -1,5 +1,6 @@
 package app.fetch.download
 
+import app.fetch.detection.MediaSignal
 import java.util.UUID
 
 enum class TransferPhase {
@@ -90,6 +91,11 @@ data class MediaCandidate(
     val durationSeconds: Double? = null,
     /** Set for qualities grouped from several sniffed files: the group's stem. */
     val groupKey: String? = null,
+    /** The on-page <video>/<audio> this came from, when known (see PageMediaSnapshot). */
+    val elementKey: String? = null,
+    val signals: Set<MediaSignal> = setOf(MediaSignal.NETWORK),
+    /** A VAST/VMAP document or other advertisement; never offered. */
+    val isAd: Boolean = false,
 )
 
 fun DownloadItem.hasKnownProgress(): Boolean = (totalBytes ?: 0L) > 0L || segmentCount > 0

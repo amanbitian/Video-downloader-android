@@ -23,25 +23,32 @@ class DownloadCoordinatorSessionTest {
     }
 
     @Test fun `late resolver result for a previous page is discarded`() = runBlocking {
+        val started = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
         val finished = CompletableDeferred<Unit>()
         // A resolver that ignores cancellation, like a blocking network read that completes anyway.
         DownloadCoordinator.streamResolver = {
+            started.complete(Unit)
             withContext(NonCancellable) { release.await() }
             finished.complete(Unit)
             ResolvedStream(listOf(quality))
         }
         val pageA = DownloadCoordinator.startNewSession()
         DownloadCoordinator.detect(stream, pageA)
-        assertEquals(1, DownloadCoordinator.candidates.value.size)
-
-        DownloadCoordinator.startNewSession() // user navigates to page B
+        assertEquals(1, DownloadCoordinator.allCandidates.value.size)
+        // Still resolving: nothing is offered yet, so the button can't open onto a half-empty sheet.
         assertTrue(DownloadCoordinator.candidates.value.isEmpty())
+
+        // The lookup must be in flight when the user leaves; one cancelled before it starts can't leak anyway.
+        withTimeout(2_000) { started.await() }
+        DownloadCoordinator.startNewSession() // user navigates to page B
+        assertTrue(DownloadCoordinator.allCandidates.value.isEmpty())
 
         release.complete(Unit)
         withTimeout(2_000) { finished.await() }
         delay(100)
-        assertTrue("page A's qualities leaked into page B", DownloadCoordinator.candidates.value.isEmpty())
+        assertTrue("page A's qualities leaked into page B", DownloadCoordinator.allCandidates.value.isEmpty())
+        assertTrue(DownloadCoordinator.candidates.value.isEmpty())
     }
 
     @Test fun `resolver result for the current page is applied`() = runBlocking {

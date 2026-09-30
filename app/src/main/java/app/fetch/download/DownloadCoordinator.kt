@@ -4,6 +4,9 @@ import android.content.Context
 import android.content.Intent
 import androidx.core.content.ContextCompat
 import app.fetch.browser.UrlUtils
+import app.fetch.detection.AdMediaClassifier
+import app.fetch.detection.PageMediaSnapshot
+import app.fetch.detection.PrimaryMediaResolver
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -34,7 +37,19 @@ object DownloadCoordinator {
     private val stateLock = Any()
     private var persistJob: Job? = null
     val downloads: StateFlow<List<DownloadItem>> = mutableDownloads.asStateFlow()
-    val candidates: StateFlow<List<MediaCandidate>> = mutableCandidates.asStateFlow()
+    private val mutableVisible = MutableStateFlow<List<MediaCandidate>>(emptyList())
+    /** What the UI offers: the page's primary video(s), fully resolved. See [PrimaryMediaResolver]. */
+    val candidates: StateFlow<List<MediaCandidate>> = mutableVisible.asStateFlow()
+    /** Every raw detection of the current page, before primary-video selection (for tests and diagnostics). */
+    internal val allCandidates: StateFlow<List<MediaCandidate>> = mutableCandidates.asStateFlow()
+
+    /** Raw detections; every change re-runs primary-video selection. Guarded by [stateLock]. */
+    private var raw: List<MediaCandidate>
+        get() = mutableCandidates.value
+        set(value) {
+            mutableCandidates.value = value
+            mutableVisible.value = PrimaryMediaResolver.select(value.filter(::isReady), snapshot, pageTitle, pageHost)
+        }
     /** Emits when the user explicitly asked to download something, so the UI opens the download sheet. */
     val sheetRequests: SharedFlow<Unit> = mutableSheetRequests.asSharedFlow()
     @Volatile private var appContext: Context? = null
@@ -91,6 +106,9 @@ object DownloadCoordinator {
     private val claimedPrefixes = HashSet<String>()
     private var pageTitle: String? = null
     private var pageThumbnail: String? = null
+    private var pageHost: String? = null
+    /** The latest DOM/metadata scan of the current page. */
+    private var snapshot: PageMediaSnapshot? = null
     /** Latest audio-only file a streaming player fetched on this page; paired with its video qualities. */
     private var sliceAudio: Pair<String, Long?>? = null
 
@@ -104,8 +122,8 @@ object DownloadCoordinator {
         probedUrls.clear()
         claimedPaths.clear()
         claimedPrefixes.clear()
-        pageTitle = null; pageThumbnail = null; sliceAudio = null
-        mutableCandidates.value = emptyList()
+        pageTitle = null; pageThumbnail = null; pageHost = null; snapshot = null; sliceAudio = null
+        raw = emptyList()
         activeSessionId = ++sessionCounter
         activeSessionId
     }
@@ -113,6 +131,9 @@ object DownloadCoordinator {
     fun detect(candidate: MediaCandidate, sessionId: Long) {
         if (sessionId != activeSessionId) return
         if (UrlUtils.isBlockedSource(candidate.url, candidate.pageUrl)) return
+        // Photos are never downloads, not even from an explicit link; thumbnails are only used for display.
+        if (isImage(candidate.url, candidate.mimeType)) return
+        if (!candidate.explicit && AdMediaClassifier.isAdUrl(candidate.url)) return
         if (!candidate.explicit && isClaimed(candidate.url)) return
         if (!candidate.explicit && !isLikelyMedia(candidate.url, candidate.mimeType)) {
             if (candidate.probe) launchProbe(candidate, sessionId, adoptOnlyIfMedia = true)
@@ -146,20 +167,29 @@ object DownloadCoordinator {
         commitIfCurrent(sessionId) {
             title?.takeIf { it.isNotBlank() }?.let { pageTitle = it }
             thumbnailUrl?.takeIf { it.startsWith("http") }?.let { pageThumbnail = it }
-            mutableCandidates.value = mutableCandidates.value.map(::withPageInfo)
+            raw = raw.map(::withPageInfo)
+        }
+    }
+
+    /** Stores the page's DOM/metadata scan; primary-video selection uses it immediately. Stale scans are ignored. */
+    fun applySnapshot(sessionId: Long, pageSnapshot: PageMediaSnapshot) {
+        commitIfCurrent(sessionId) {
+            snapshot = pageSnapshot
+            pageHost = UrlUtils.host(pageSnapshot.pageUrl).ifBlank { pageHost }
+            raw = raw
         }
     }
 
     fun dismissCandidate(url: String) {
-        synchronized(stateLock) { mutableCandidates.value = mutableCandidates.value.filterNot { it.url == url } }
+        synchronized(stateLock) { raw = raw.filterNot { it.url == url } }
     }
 
     fun isAlreadyDownloaded(url: String, videoKey: String? = null): Boolean =
         downloads.value.any { it.phase == TransferPhase.COMPLETED && it.sourceUrl == url && it.videoKey == videoKey }
 
-    fun enqueue(context: Context, candidate: MediaCandidate, variant: MediaVariant? = null) {
+    fun enqueue(context: Context, candidate: MediaCandidate, variant: MediaVariant? = null, title: String? = null) {
         val item = DownloadItem(
-            title = MediaFiles.safeTitle(candidate.title), sourceUrl = variant?.url ?: candidate.url,
+            title = MediaFiles.safeTitle(title?.takeIf { it.isNotBlank() } ?: candidate.title), sourceUrl = variant?.url ?: candidate.url,
             mimeType = candidate.mimeType.takeIf { variant == null }, streamType = variant?.streamType ?: candidate.streamType,
             requestHeaders = candidate.requestHeaders, totalBytes = candidate.sizeBytes.takeIf { variant == null },
             estimatedBytes = variant?.estimatedBytes, videoKey = variant?.videoKey, audioKey = variant?.audioKey,
@@ -214,14 +244,37 @@ object DownloadCoordinator {
         if (sessionId != activeSessionId) null else block()
     }
 
+    /** Adds a detection, or folds what it adds (page signals, player element, poster) into the entry that already has it. */
     private fun addLocked(candidate: MediaCandidate): Boolean {
         val key = candidateKey(candidate)
-        if (mutableCandidates.value.any { candidateKey(it) == key }) return false
         val path = candidate.url.substringBefore('?')
-        if (!candidate.explicit && mutableCandidates.value.any { group -> group.variants.any { it.url.substringBefore('?') == path } }) return false
-        mutableCandidates.value = (mutableCandidates.value + candidate).takeLast(MAX_CANDIDATES)
+        val existing = raw.firstOrNull { candidateKey(it) == key }
+            ?: raw.firstOrNull { group -> !candidate.explicit && group.variants.any { it.url.substringBefore('?') == path } }
+        if (existing != null) {
+            raw = raw.map { if (it === existing) it.mergedWith(candidate) else it }
+            return false
+        }
+        raw = (raw + candidate.copy(resolved = candidate.resolved || candidate.explicit || candidate.sizeBytes != null)).takeLast(MAX_CANDIDATES)
         return true
     }
+
+    private fun MediaCandidate.mergedWith(other: MediaCandidate) = copy(
+        signals = signals + other.signals,
+        elementKey = elementKey ?: other.elementKey,
+        thumbnailUrl = thumbnailUrl ?: other.thumbnailUrl,
+    )
+
+    /** Only candidates whose lookups have finished are shown, so the button never opens onto a half-empty sheet. */
+    private fun isReady(candidate: MediaCandidate): Boolean = when {
+        candidate.explicit -> true
+        candidate.isAd -> false
+        candidate.streamType != StreamType.DIRECT -> candidate.resolved && (candidate.variants.isNotEmpty() || candidate.note != null)
+        candidate.groupKey != null -> candidate.variants.isNotEmpty()
+        else -> candidate.resolved
+    }
+
+    private fun isImage(url: String, mime: String?): Boolean =
+        mime?.trim()?.lowercase()?.startsWith("image/") == true || MediaFiles.kindOf(MediaFiles.resolveMime(StreamType.DIRECT, url)) == MediaKind.IMAGE
 
     private fun withPageInfo(candidate: MediaCandidate): MediaCandidate = if (candidate.explicit) candidate else candidate.copy(
         title = pageTitle ?: candidate.title,
@@ -235,9 +288,9 @@ object DownloadCoordinator {
             claimedPaths += resolved.claimedPaths
             claimedPrefixes += resolved.claimedPrefixes
             // Sniffed copies of this manifest's own representations/segments are not separate videos.
-            mutableCandidates.value = mutableCandidates.value.mapNotNull { existing ->
+            raw = raw.mapNotNull { existing ->
                 when {
-                    existing.url == candidate.url -> existing.copy(variants = resolved.variants, resolved = true, note = resolved.note, durationSeconds = resolved.durationSeconds)
+                    existing.url == candidate.url -> existing.copy(variants = resolved.variants, resolved = true, note = resolved.note, durationSeconds = resolved.durationSeconds, isAd = resolved.isAd)
                     existing.explicit -> existing
                     existing.groupKey != null -> existing.copy(variants = existing.variants.filterNot { isClaimedLocked(it.url) }).takeIf { it.variants.isNotEmpty() }
                     isClaimedLocked(existing.url) -> null
@@ -258,7 +311,7 @@ object DownloadCoordinator {
                 if (mime != null && !mime.startsWith("video/") && !mime.startsWith("audio/") && !isLikelyMedia(candidate.url, null)) return@commitIfCurrent
                 if (mime?.startsWith("audio/") == true && candidate.sliceFetch) {
                     sliceAudio = candidate.url to info?.sizeBytes
-                    mutableCandidates.value = mutableCandidates.value.map { if (it.groupKey != null && it.sliceFetch) it.withAudio() else it }
+                    raw = raw.map { if (it.groupKey != null && it.sliceFetch) it.withAudio() else it }
                     return@commitIfCurrent
                 }
                 val height = MediaGrouping.heightOf(candidate.url)
@@ -269,20 +322,21 @@ object DownloadCoordinator {
                 )
                 val path = candidate.url.substringBefore('?')
                 // Two players on a page can show the same files; a group that already has this file absorbs it.
-                val existing = mutableCandidates.value.firstOrNull { it.groupKey == stem }
-                    ?: mutableCandidates.value.firstOrNull { it.groupKey != null && it.variants.any { v -> v.url.substringBefore('?') == path } }
-                var group = (existing ?: withPageInfo(candidate.copy(groupKey = stem, mimeType = mime ?: candidate.mimeType)))
+                val existing = raw.firstOrNull { it.groupKey == stem }
+                    ?: raw.firstOrNull { it.groupKey != null && it.variants.any { v -> v.url.substringBefore('?') == path } }
+                var group = (existing?.mergedWith(candidate) ?: withPageInfo(candidate.copy(groupKey = stem, mimeType = mime ?: candidate.mimeType)))
                     .let { it.copy(variants = (it.variants + quality).distinctBy { v -> v.url }) }
                 // Probes finish in any order, so two groups may have formed before they shared a file; fold them together now.
                 val paths = group.variants.map { it.url.substringBefore('?') }.toSet()
-                val overlapping = mutableCandidates.value.filter { it !== existing && it.groupKey != null && it.variants.any { v -> v.url.substringBefore('?') in paths } }
-                if (overlapping.isNotEmpty()) group = group.copy(variants = (group.variants + overlapping.flatMap { it.variants }).distinctBy { v -> v.url })
+                val overlapping = raw.filter { it !== existing && it.groupKey != null && it.variants.any { v -> v.url.substringBefore('?') in paths } }
+                if (overlapping.isNotEmpty()) group = overlapping.fold(group) { merged, other -> merged.mergedWith(other) }
+                    .copy(variants = (group.variants + overlapping.flatMap { it.variants }).distinctBy { v -> v.url })
                 group = if (group.sliceFetch) group.withAudio() else group.describeQualities()
                 // The same file may already be listed on its own (seen on the network first); the group replaces it.
-                val others = mutableCandidates.value.filterNot {
+                val others = raw.filterNot {
                     it in overlapping || (it.groupKey == null && !it.explicit && it.url.substringBefore('?') in paths)
                 }
-                mutableCandidates.value = if (existing == null) (others + group).takeLast(MAX_CANDIDATES)
+                raw = if (existing == null) (others + group).takeLast(MAX_CANDIDATES)
                 else others.map { if (it === existing) group else it }
             }
         }
@@ -309,17 +363,22 @@ object DownloadCoordinator {
     private fun launchProbe(candidate: MediaCandidate, sessionId: Long, adoptOnlyIfMedia: Boolean) {
         if (!probedUrls.add(candidate.url.substringBefore('?'))) return
         scope.launch(sessionJob) {
-            val info = runCatching { MediaProbe.probe(candidate.url, candidate.requestHeaders) }.getOrNull() ?: return@launch
+            val info = runCatching { MediaProbe.probe(candidate.url, candidate.requestHeaders) }.getOrNull()
             commitIfCurrent(sessionId) {
+                if (info == null) {
+                    // The server wouldn't say; a file the page itself uses is still offered, just without a size.
+                    if (!adoptOnlyIfMedia) raw = raw.map { if (it.url == candidate.url) it.copy(resolved = true) else it }
+                    return@commitIfCurrent
+                }
                 if (adoptOnlyIfMedia) {
                     val mime = info.mimeType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
                     val isMedia = mime.startsWith("video/") || mime.startsWith("audio/")
                     // UI sounds and previews are tiny; real downloads are not.
                     if (!isMedia || (info.sizeBytes ?: Long.MAX_VALUE) < MIN_PROBED_MEDIA_BYTES) return@commitIfCurrent
-                    addLocked(withPageInfo(candidate.copy(mimeType = mime, sizeBytes = info.sizeBytes, probe = false)))
+                    addLocked(withPageInfo(candidate.copy(mimeType = mime, sizeBytes = info.sizeBytes, probe = false, resolved = true)))
                 } else {
-                    mutableCandidates.value = mutableCandidates.value.map {
-                        if (it.url == candidate.url) it.copy(sizeBytes = info.sizeBytes ?: it.sizeBytes, mimeType = it.mimeType ?: info.mimeType) else it
+                    raw = raw.map {
+                        if (it.url == candidate.url) it.copy(sizeBytes = info.sizeBytes ?: it.sizeBytes, mimeType = it.mimeType ?: info.mimeType, resolved = true) else it
                     }
                 }
             }
@@ -383,7 +442,8 @@ object DownloadCoordinator {
 
     private const val PREFERENCES = "fetch_downloads"
     private const val DOWNLOADS_KEY = "items"
-    private const val MAX_CANDIDATES = 12
+    /** Raw detections per page; selection decides what is shown, so preview grids must not evict the main video. */
+    private const val MAX_CANDIDATES = 80
     private const val PERSIST_DEBOUNCE_MS = 1_000L
     private const val MIN_PROBED_MEDIA_BYTES = 100L * 1024
 }
