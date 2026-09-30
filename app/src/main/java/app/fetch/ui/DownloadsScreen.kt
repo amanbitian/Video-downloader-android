@@ -68,6 +68,7 @@ import app.fetch.download.DownloadService
 import app.fetch.download.MediaActions
 import app.fetch.download.MediaKind
 import app.fetch.download.TransferPhase
+import app.fetch.download.asEstimatedSize
 import app.fetch.download.asReadableBytes
 import app.fetch.download.hasKnownProgress
 import app.fetch.download.kind
@@ -232,12 +233,16 @@ private fun detailText(item: DownloadItem, kind: MediaKind): String = when (item
     TransferPhase.CONNECTING -> item.error ?: "Connecting…"
     TransferPhase.DOWNLOADING -> buildString {
         append(item.downloadedBytes.asReadableBytes())
-        item.totalBytes?.let { append(" / ${it.asReadableBytes()}") }
-        if (item.totalBytes == null && item.segmentCount > 0) append(" · ${item.segmentIndex}/${item.segmentCount} parts")
+        when {
+            item.totalBytes != null -> append(" / ${item.totalBytes.asReadableBytes()}")
+            item.estimatedBytes != null -> append(" / ${item.estimatedBytes.asEstimatedSize()}")
+        }
+        if (item.totalBytes == null && item.segmentCount > 0) append(" · ${(item.progress() * 100).toInt()}%")
         append(" · ${item.bytesPerSecond.asReadableBytes()}/s")
     }
     TransferPhase.VERIFYING -> "Saving to your device…"
-    TransferPhase.COMPLETED -> listOfNotNull(item.totalBytes?.asReadableBytes(), if (kind == MediaKind.VIDEO || kind == MediaKind.AUDIO) "Tap to play" else "Tap to open").joinToString(" · ")
+    TransferPhase.PROCESSING -> if (item.audioKey != null) "Merging video and audio…" else "Converting to a playable file…"
+    TransferPhase.COMPLETED -> item.error ?: listOfNotNull(item.totalBytes?.asReadableBytes(), if (kind == MediaKind.VIDEO || kind == MediaKind.AUDIO) "Tap to play" else "Tap to open").joinToString(" · ")
     TransferPhase.FAILED -> item.error ?: "Download failed"
     TransferPhase.PAUSED -> item.error ?: "Paused at ${item.downloadedBytes.asReadableBytes()}"
     TransferPhase.CANCELLED -> "Cancelled"

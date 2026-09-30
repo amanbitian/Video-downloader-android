@@ -77,7 +77,9 @@ Fetch is organised around a clean separation between the **Browser**, the **Medi
 * Each visible page gets a **session**; media reported for an old page, a background tab or the page just left is dropped.
 * **Sources:** URL-sniffed sub-resources; the injected `<video>`/`<audio>` script (`FetchMedia` bridge); `Range: bytes=0-` requests confirmed by `MediaProbe`; explicit downloads from `DownloadListener` or the long-press menu.
 * **Headers** replay what the page sent (real User-Agent, Referer, Origin) plus cookies from `CookieManager`.
-* **`HlsResolver`** parses master playlists (quoted attributes, separate-audio detection) and media playlists (absolute segment URLs; rejects encrypted, fMP4 and byte-range streams with readable errors).
+* **Resolvers → `ResolvedStream`:** `HlsResolver` (master + media playlists: audio renditions, fMP4 init, byte-range single files) and `DashManifest`/`DashResolver` (templates, timelines, lists, single files, `ContentProtection`, live) turn a manifest into one candidate with a quality per resolution. `AudioPolicy` pairs each quality with an audio track (main role, default/device language, container-compatible codec, bitrate); `Codecs` knows which pairs `MediaMuxer` can combine. Resolvers also return the paths and directories the manifest owns.
+* **Grouping (`MediaGrouping`, `DownloadCoordinator.detectQuality`)**: sniffed files that a manifest claims are dropped; byte-range (MSE) slices, quality-named files and a `<video>`'s alternative sources are grouped as qualities of one video (with separately fetched audio paired when a player streams it).
+* **Page info:** the page's `og:title` (cleaned by `TitleNormalizer`), `og:image` or poster name and illustrate sniffed candidates.
 
 ### 4. Download Coordinator (`DownloadCoordinator.kt`)
 * Single source of truth for downloads and candidates (`StateFlow`), guarded by `stateLock`.
@@ -88,7 +90,9 @@ Fetch is organised around a clean separation between the **Browser**, the **Medi
 * **Foreground-service contract:** every `onStartCommand` calls `startForeground()` first, since every command arrives via `startForegroundService()`. The service stops itself with `stopSelfResult()` once nothing is queued or running. `onTimeout` (Android 15 `dataSync` limit) pauses cleanly.
 * **Queue:** a `Semaphore` sized from settings; waiting items are `QUEUED`.
 * **Direct:** `Range: bytes=N-` + `If-Range`; a 200 reply means the file changed, so the download restarts; 416 at full length is treated as complete.
-* **HLS:** segments appended in order; after each one the byte offset and index are checkpointed, so a retry truncates to the last checkpoint and continues.
+* **Tracks (HLS, DASH, direct + separate audio):** the manifest is re-fetched on every (re)start and resolved into tracks — a single file (range-resumed) or init + segments. Segments are appended in order and checkpointed (`trackIndex`, `segmentIndex`, `segmentOffset`), so a retry keeps finished tracks and truncates the current one to its last checkpoint.
+* **Merge / convert (`MediaRemuxer`):** tracks are combined with `MediaExtractor` + `MediaMuxer` into MP4 or WebM without re-encoding (samples interleaved by timestamp; TS-sourced AAC is split from ADTS runs into raw frames). If merging fails, the untouched video is kept and the item notes it was saved without audio.
+* **Free space:** checked against download + merge + shared-storage copy before a transfer starts.
 * **Retries:** up to 3 with exponential backoff for I/O errors and 5xx/408/429.
 * **Publishing:** `MediaFiles` resolves the real MIME type (declared → `Content-Type` → extension) and file name; the file is inserted as pending into the matching MediaStore collection (falling back to Downloads), copied, then published.
 

@@ -11,6 +11,8 @@ import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.ServiceWorkerClient
+import android.webkit.ServiceWorkerController
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -30,8 +32,11 @@ import androidx.compose.runtime.setValue
 import app.fetch.download.DownloadCoordinator
 import app.fetch.download.MediaCandidate
 import app.fetch.download.MediaFiles
+import app.fetch.download.MediaGrouping
 import app.fetch.download.StreamType
 import org.json.JSONArray
+import org.json.JSONObject
+import java.net.URL
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 
@@ -76,6 +81,8 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
 
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
     private var pendingPageFocus = false
+    /** The visible tab, for callbacks on worker threads (service worker) that can't read Compose state. */
+    private val activeTabRef = AtomicReference<BrowserTab?>(null)
     private val webViews = HashMap<String, WebView>()
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private val fileChooser = activity.registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -88,7 +95,17 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
         saved.forEach { tabs += BrowserTab(it.id, it.url, it.title) }
         if (tabs.isEmpty()) tabs += BrowserTab(UUID.randomUUID().toString(), "", "")
         activeTabId = tabs.firstOrNull { it.id == activeId }?.id ?: tabs.first().id
+        activeTabRef.set(activeTab)
         startSession(activeTab)
+        // Media fetched by a site's service worker never reaches a WebViewClient; route it into the same pipeline.
+        runCatching {
+            ServiceWorkerController.getInstance().setServiceWorkerClient(object : ServiceWorkerClient() {
+                override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? {
+                    activeTabRef.get()?.let { intercept(it, request) }
+                    return null
+                }
+            })
+        }
     }
 
     val activeTab: BrowserTab get() = tabs.firstOrNull { it.id == activeTabId } ?: tabs.first()
@@ -125,6 +142,7 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
         val tab = tabs.firstOrNull { it.id == id } ?: return
         if (id != activeTabId) webViews[activeTabId]?.onPause()
         activeTabId = id
+        activeTabRef.set(tab)
         webViews[id]?.onResume()
         startSession(tab)
         webViews[id]?.evaluateJavascript(RESCAN_SCRIPT, null)
@@ -223,6 +241,7 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
     fun onResume() { webViews[activeTabId]?.onResume() }
 
     fun destroy() {
+        runCatching { ServiceWorkerController.getInstance().setServiceWorkerClient(null) }
         exitFullscreen()
         webViews.values.forEach(::destroyWebView)
         webViews.clear()
@@ -245,9 +264,25 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
         }
     }
 
+    /** One pipeline for page and service-worker requests, so the same file is never reported by two routes. */
+    private fun intercept(tab: BrowserTab, request: WebResourceRequest) {
+        if (request.isForMainFrame) return
+        val url = request.url.toString()
+        val headers = request.requestHeaders
+        val range = headers?.entries?.firstOrNull { it.key.equals("Range", ignoreCase = true) }?.value
+        val slice = MediaGrouping.isSliceRequest(url, range)
+        if (UrlUtils.isCandidateUrl(url)) {
+            report(tab, url, null, headers, explicit = false, sliceFetch = slice)
+        } else if (!UrlUtils.isStaticAsset(url) && range?.startsWith("bytes=0-") == true) {
+            // <video>/<audio> elements fetch with "Range: bytes=0-"; it is the only hint for extension-less media URLs.
+            report(tab, url, null, headers, explicit = false, probe = true, sliceFetch = slice)
+        }
+    }
+
     private fun report(
         tab: BrowserTab, url: String, mime: String?, requestHeaders: Map<String, String>?, explicit: Boolean,
-        title: String? = null, sizeBytes: Long? = null, probe: Boolean = false,
+        title: String? = null, sizeBytes: Long? = null, probe: Boolean = false, sliceFetch: Boolean = false, thumbnailUrl: String? = null,
+        groupKey: String? = null,
     ) {
         if (!url.startsWith("http", ignoreCase = true)) return
         if (!explicit && url == tab.previousPageUrl) return
@@ -261,7 +296,7 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
         val candidate = MediaCandidate(
             url = url, title = title ?: tab.pageTitle.get().takeIf(::isUsableTitle) ?: fileName, mimeType = mime, streamType = streamType,
             requestHeaders = headersFor(tab, url, requestHeaders), pageUrl = tab.pageUrl.get(), explicit = explicit,
-            probe = probe, sizeBytes = sizeBytes,
+            probe = probe, sizeBytes = sizeBytes, sliceFetch = sliceFetch, thumbnailUrl = thumbnailUrl, groupKey = groupKey,
         )
         if (explicit) DownloadCoordinator.detect(candidate) else DownloadCoordinator.detect(candidate, tab.sessionId)
     }
@@ -340,9 +375,10 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
     /** Receives <video>/<audio> sources from the injected script; runs on a WebView binder thread. */
     private inner class MediaBridge(private val tab: BrowserTab) {
         @JavascriptInterface
-        fun onMedia(src: String?) {
+        fun onMedia(src: String?, poster: String?, elementKey: String?) {
             val url = src?.takeIf { it.startsWith("http", ignoreCase = true) } ?: return
-            report(tab, url, null, null, explicit = false, probe = true)
+            report(tab, url, null, null, explicit = false, probe = true, thumbnailUrl = poster?.takeIf { it.startsWith("http", ignoreCase = true) },
+                groupKey = elementKey?.ifBlank { null }?.let { "element:${tab.sessionId}:$it" })
         }
     }
 
@@ -369,27 +405,20 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
         override fun onPageFinished(view: WebView, url: String?) {
             tab.canGoBack = view.canGoBack()
             tab.canGoForward = view.canGoForward()
-            view.evaluateJavascript(TITLE_SCRIPT) { result ->
-                val title = decodeJsString(result)
-                if (isUsableTitle(title)) {
-                    tab.pageTitle.set(title)
-                    DownloadCoordinator.applyPageTitle(tab.sessionId, title)
-                }
+            view.evaluateJavascript(PAGE_INFO_SCRIPT) { result ->
+                val info = runCatching { JSONObject(decodeJsString(result)) }.getOrNull() ?: return@evaluateJavascript
+                val page = tab.pageUrl.get()
+                val title = info.optString("title").takeIf(::isUsableTitle)?.let { TitleNormalizer.clean(it, info.optString("site").ifBlank { null }, UrlUtils.host(page)) }
+                val image = info.optString("image").ifBlank { null }?.let { runCatching { URL(URL(page), it).toString() }.getOrNull() }
+                title?.let(tab.pageTitle::set)
+                DownloadCoordinator.applyPageInfo(tab.sessionId, title, image)
             }
             view.evaluateJavascript(MEDIA_SCRIPT, null)
             persist()
         }
 
         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-            if (request.isForMainFrame) return null
-            val url = request.url.toString()
-            val headers = request.requestHeaders
-            if (UrlUtils.isCandidateUrl(url)) {
-                report(tab, url, null, headers, explicit = false)
-            } else if (!UrlUtils.isStaticAsset(url) && headers?.any { it.key.equals("Range", true) && it.value.startsWith("bytes=0-") } == true) {
-                // <video>/<audio> elements fetch with "Range: bytes=0-"; it is the only hint for extension-less media URLs.
-                report(tab, url, null, headers, explicit = false, probe = true)
-            }
+            intercept(tab, request)
             return null
         }
 
@@ -404,8 +433,9 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
             if (title.isNullOrBlank()) return
             tab.title = title
             if (tab.pageTitle.get().isBlank() && isUsableTitle(title)) {
-                tab.pageTitle.set(title)
-                DownloadCoordinator.applyPageTitle(tab.sessionId, title)
+                val clean = TitleNormalizer.clean(title, null, UrlUtils.host(tab.pageUrl.get()))
+                tab.pageTitle.set(clean)
+                DownloadCoordinator.applyPageInfo(tab.sessionId, clean, null)
             }
             store.updateTitle(view.url.orEmpty(), title)
         }
@@ -476,11 +506,16 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
         val WEB_SCHEMES = setOf("http", "https", "about", "data", "blob", "javascript")
         val DROPPED_HEADERS = setOf("range", "if-range", "if-none-match", "if-modified-since", "accept-encoding", "cookie")
         const val DESKTOP_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
-        val TITLE_SCRIPT = """
+        /** Title, site name and preview image for naming downloads and showing a thumbnail in the sheet. */
+        val PAGE_INFO_SCRIPT = """
             (() => {
-                const og = document.querySelector('meta[property="og:title"]')?.content;
-                const twitter = document.querySelector('meta[name="twitter:title"]')?.content;
-                return og || twitter || document.title || "";
+                const meta = (selector) => document.querySelector(selector)?.content || "";
+                const video = document.querySelector('video[poster]');
+                return JSON.stringify({
+                    title: meta('meta[property="og:title"]') || meta('meta[name="twitter:title"]') || document.title || "",
+                    site: meta('meta[property="og:site_name"]'),
+                    image: meta('meta[property="og:image"]') || meta('meta[name="twitter:image"]') || (video ? video.getAttribute('poster') : "")
+                });
             })()
         """.trimIndent()
         /** Reports <video>/<audio> sources now and whenever one starts playing (lazy players, infinite feeds). */
@@ -492,9 +527,11 @@ class BrowserController(private val activity: ComponentActivity, val store: Brow
                         var urls = [el.currentSrc, el.src];
                         var sources = el.querySelectorAll ? el.querySelectorAll('source') : [];
                         for (var i = 0; i < sources.length; i++) urls.push(sources[i].src);
-                        for (var j = 0; j < urls.length; j++) {
-                            if (urls[j] && /^https?:/i.test(urls[j])) FetchMedia.onMedia(urls[j]);
-                        }
+                        urls = urls.filter(function(u, k) { return u && /^https?:/i.test(u) && urls.indexOf(u) === k; });
+                        // Alternative <source> formats of one element are one video, not several.
+                        if (!el.__fetchKey) el.__fetchKey = 'v' + (window.__fetchSeq = (window.__fetchSeq || 0) + 1);
+                        var key = urls.length > 1 ? el.__fetchKey : "";
+                        for (var j = 0; j < urls.length; j++) FetchMedia.onMedia(urls[j], el.poster || "", key);
                     } catch (e) {}
                 }
                 window.__fetchScanMedia = function() {

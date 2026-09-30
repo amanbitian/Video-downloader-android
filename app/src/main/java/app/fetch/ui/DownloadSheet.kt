@@ -24,9 +24,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -46,12 +48,13 @@ fun DownloadBottomSheet(
     onDismiss: () -> Unit,
     onDownload: (MediaCandidate, MediaVariant?) -> Unit,
 ) {
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    // Fully expanded from the start, so cards that arrive late don't shift the buttons under the user's finger.
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
-            Text("Download", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(if (candidates.size > 1) "Download · ${candidates.size} videos found" else "Download", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(16.dp))
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.heightIn(max = 460.dp)) {
-                items(candidates, key = { it.url }) { candidate -> CandidateCard(candidate, onDownload) }
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.heightIn(max = 520.dp)) {
+                items(candidates, key = { it.groupKey ?: it.url }) { candidate -> CandidateCard(candidate, onDownload) }
             }
         }
     }
@@ -60,37 +63,50 @@ fun DownloadBottomSheet(
 @Composable
 private fun CandidateCard(candidate: MediaCandidate, onDownload: (MediaCandidate, MediaVariant?) -> Unit) {
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val isStream = candidate.streamType != StreamType.DIRECT
     Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp)) {
-            Text(candidate.title, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            val fileName = candidate.url.substringBefore('?').substringAfterLast('/')
-            val meta = listOfNotNull(
-                fileName.takeIf { it.isNotBlank() && it != candidate.title },
-                candidate.sizeBytes?.asReadableBytes(),
-                "Already downloaded".takeIf { DownloadCoordinator.isAlreadyDownloaded(candidate.url) },
-            ).joinToString(" · ")
-            if (meta.isNotBlank()) Text(meta, color = muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (candidate.thumbnailUrl != null) {
+                    RemoteImage(candidate.thumbnailUrl, Modifier.width(96.dp).height(54.dp).clip(RoundedCornerShape(8.dp)))
+                    Spacer(Modifier.width(12.dp))
+                }
+                Column(Modifier.weight(1f)) {
+                    Text(candidate.title, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    val fileName = candidate.url.substringBefore('?').substringAfterLast('/')
+                    val meta = listOfNotNull(
+                        fileName.takeIf { it.isNotBlank() && it != candidate.title && candidate.variants.isEmpty() && !isStream },
+                        candidate.durationSeconds?.let(::formatDuration),
+                        candidate.sizeBytes?.takeIf { candidate.variants.isEmpty() }?.asReadableBytes(),
+                        "Already downloaded".takeIf { candidate.variants.isEmpty() && DownloadCoordinator.isAlreadyDownloaded(candidate.url) },
+                    ).joinToString(" · ")
+                    if (meta.isNotBlank()) Text(meta, color = muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
             Spacer(Modifier.height(10.dp))
             when {
-                candidate.streamType == StreamType.HLS && !candidate.resolved ->
-                    Text("Resolving available qualities…", color = muted, fontSize = 13.sp)
-                candidate.streamType == StreamType.HLS && candidate.variants.isEmpty() ->
-                    Text(candidate.note ?: "No downloadable quality found.", color = muted, fontSize = 13.sp)
-                candidate.streamType == StreamType.HLS -> candidate.variants.forEach { variant ->
+                isStream && !candidate.resolved -> Text("Finding available qualities…", color = muted, fontSize = 13.sp)
+                candidate.variants.isNotEmpty() -> candidate.variants.forEachIndexed { index, variant ->
                     Row(
                         Modifier.fillMaxWidth().clickable { onDownload(candidate, variant) }.padding(vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(Modifier.weight(1f)) {
-                            Text(variant.label, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
-                            Text(variant.detail, color = muted, fontSize = 12.sp)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(variant.label, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
+                                val tags = listOfNotNull(
+                                    "Best quality".takeIf { index == 0 && candidate.variants.size > 1 },
+                                    "Downloaded".takeIf { DownloadCoordinator.isAlreadyDownloaded(variant.url, variant.videoKey) },
+                                ).joinToString(" · ")
+                                if (tags.isNotEmpty()) Text("  $tags", color = muted, fontSize = 12.sp)
+                            }
+                            if (variant.detail.isNotBlank()) Text(variant.detail, color = muted, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         }
                         Icon(Icons.Default.Download, "Download ${variant.label}", tint = MaterialTheme.colorScheme.primary)
                     }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    if (index < candidate.variants.lastIndex) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 }
-                candidate.streamType == StreamType.DASH ->
-                    Text("DASH streams are detected but can't be downloaded yet.", color = muted, fontSize = 13.sp)
+                isStream -> Text(candidate.note ?: "No downloadable quality found.", color = muted, fontSize = 13.sp)
                 else -> {
                     val label = when (MediaFiles.kindOf(MediaFiles.resolveMime(candidate.streamType, candidate.url, candidate.mimeType))) {
                         MediaKind.VIDEO -> "Download video"
@@ -107,4 +123,9 @@ private fun CandidateCard(candidate: MediaCandidate, onDownload: (MediaCandidate
             }
         }
     }
+}
+
+private fun formatDuration(seconds: Double): String {
+    val total = seconds.toLong()
+    return if (total >= 3600) "%d:%02d:%02d".format(total / 3600, total % 3600 / 60, total % 60) else "%d:%02d".format(total / 60, total % 60)
 }

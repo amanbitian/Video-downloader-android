@@ -11,6 +11,7 @@ import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.Environment
 import android.os.IBinder
+import android.os.StatFs
 import android.provider.MediaStore
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -98,8 +99,8 @@ class DownloadService : Service() {
         val job = jobs.remove(id)
         job?.cancel()
         DownloadCoordinator.update(id) { it.copy(phase = TransferPhase.CANCELLED, error = null, bytesPerSecond = 0L) }
-        // A running job deletes its own part file once its streams are closed.
-        if (job == null) DownloadCoordinator.partFile(this, id).delete()
+        // A running job deletes its own files once its streams are closed.
+        if (job == null) DownloadCoordinator.deleteParts(this, id)
     }
 
     private suspend fun run(id: String) {
@@ -114,11 +115,8 @@ class DownloadService : Service() {
                     return
                 }
                 try {
-                    when (item.streamType) {
-                        StreamType.DASH -> throw UnsupportedStreamException("DASH downloads are not supported yet.")
-                        StreamType.HLS -> transferHls(item, id, part)
-                        StreamType.DIRECT -> transferDirect(item, id, part)
-                    }
+                    ensureFreeSpace(item)
+                    if (item.streamType == StreamType.DIRECT && item.audioKey == null) transferDirect(item, id, part) else transferTracks(item, id)
                     return
                 } catch (failure: IOException) {
                     currentCoroutineContext().ensureActive()
@@ -137,9 +135,9 @@ class DownloadService : Service() {
         } finally {
             self?.let { jobs.remove(id, it) }
             val latest = DownloadCoordinator.find(id)
-            if (latest == null || latest.phase == TransferPhase.CANCELLED) part.delete()
+            if (latest == null || latest.phase == TransferPhase.CANCELLED) DownloadCoordinator.deleteParts(this, id)
             // Progress ticks are throttled; show the real resume point, not the last tick.
-            else if (latest.phase == TransferPhase.PAUSED && latest.streamType == StreamType.DIRECT) {
+            else if (latest.phase == TransferPhase.PAUSED && latest.streamType == StreamType.DIRECT && latest.audioKey == null) {
                 val length = part.length()
                 DownloadCoordinator.update(id) { it.copy(downloadedBytes = length) }
             }
@@ -196,41 +194,144 @@ class DownloadService : Service() {
         }
     }
 
-    /** Downloads unencrypted transport-stream HLS in playlist order, checkpointing after every segment so a retry resumes. */
-    private suspend fun transferHls(item: DownloadItem, id: String, part: File) {
-        progress(id) { it.copy(phase = TransferPhase.CONNECTING, totalBytes = null) }
+    /** One elementary stream fetched to its own file: a complete file, or an optional init segment followed by media segments. */
+    private class Track(val initUrl: String?, val urls: List<String>, val mime: String?) {
+        val isSingleFile get() = initUrl == null && urls.size == 1
+        /** Progress units: segments, or 1 for a single file. */
+        val units get() = if (isSingleFile) 1 else urls.size
+    }
+
+    /** Re-resolves what to fetch from the manifest on every (re)start, so expiring segment URLs are always fresh. */
+    private fun planTracks(item: DownloadItem): List<Track> = when (item.streamType) {
+        StreamType.HLS -> listOfNotNull(item.sourceUrl, item.audioKey).map { url ->
+            val playlist = HlsResolver.mediaPlaylist(url, HlsResolver.fetchText(url, item.requestHeaders))
+            Track(playlist.initUrl, playlist.segments, if (playlist.isFragmentedMp4) "video/mp4" else "video/mp2t")
+        }
+        StreamType.DASH -> {
+            val manifest = DashManifest.parse(item.sourceUrl, HlsResolver.fetchText(item.sourceUrl, item.requestHeaders))
+            if (manifest.isLive) throw UnsupportedStreamException("Live streams can't be downloaded.")
+            listOfNotNull(item.videoKey, item.audioKey).map { key ->
+                val rep = manifest.representation(key) ?: throw UnsupportedStreamException("This quality is no longer offered by the stream.")
+                if (rep.isProtected) throw UnsupportedStreamException("This video is DRM-protected and can't be downloaded.")
+                Track(rep.initUrl, rep.segmentUrls, rep.mimeType)
+            }.ifEmpty { throw UnsupportedStreamException("Pick a quality from the download sheet to download this stream.") }
+        }
+        StreamType.DIRECT -> listOfNotNull(item.sourceUrl, item.audioKey).map { Track(null, listOf(it), null) }
+    }
+
+    /**
+     * Fetches every track (checkpointing per segment), then merges them into one playable file. Checkpoints survive
+     * process death: finished tracks are kept and the current one resumes at its last complete segment.
+     */
+    private suspend fun transferTracks(item: DownloadItem, id: String) {
+        progress(id) { it.copy(phase = TransferPhase.CONNECTING) }
         refreshNotification()
-        val manifest = openConnection(item.sourceUrl, item.requestHeaders).useText()
-        val segments = HlsResolver.mediaSegments(item.sourceUrl, manifest)
-        val resume = item.segmentIndex in 1..segments.size && item.segmentCount == segments.size && part.length() >= item.segmentOffset
-        val startIndex = if (resume) item.segmentIndex else 0
-        val startBytes = if (resume) item.segmentOffset else 0L
-        // Drop any half-written segment beyond the last checkpoint.
-        if (resume) RandomAccessFile(part, "rw").use { it.setLength(startBytes) } else part.delete()
+        val tracks = planTracks(item)
+        val totalUnits = tracks.sumOf { it.units }
+        val resume = item.segmentCount == totalUnits && item.trackIndex in 0..tracks.size
+        if (!resume) DownloadCoordinator.deleteParts(this, id)
+        val firstTrack = if (resume) item.trackIndex else 0
+        val meter = SpeedMeter((0 until firstTrack).sumOf { DownloadCoordinator.trackFile(this, id, it).length() })
+        var unitsBefore = tracks.take(firstTrack).sumOf { it.units }
+        val startUnits = unitsBefore
         progress(id) {
-            it.copy(phase = TransferPhase.DOWNLOADING, downloadedBytes = startBytes, segmentIndex = startIndex, segmentOffset = startBytes, segmentCount = segments.size, error = null)
+            it.copy(phase = TransferPhase.DOWNLOADING, trackIndex = firstTrack, segmentsBefore = startUnits, segmentCount = totalUnits, totalBytes = null,
+                segmentIndex = if (resume) it.segmentIndex else 0, segmentOffset = if (resume) it.segmentOffset else 0L, error = null)
         }
         refreshNotification()
-        val meter = SpeedMeter(startBytes)
-        FileOutputStream(part, resume).buffered(BUFFER_SIZE).use { output ->
-            for (index in startIndex until segments.size) {
+        for (index in firstTrack until tracks.size) {
+            val track = tracks[index]
+            val file = DownloadCoordinator.trackFile(this, id, index)
+            val checkpoint = resume && index == item.trackIndex
+            if (track.isSingleFile) fetchWholeFile(track.urls.single(), item.requestHeaders, file, id, meter)
+            else fetchSegments(track, item.requestHeaders, file, id, meter, if (checkpoint) item.segmentIndex else 0, if (checkpoint) item.segmentOffset else 0L)
+            unitsBefore += track.units
+            val done = unitsBefore
+            progress(id) { it.copy(trackIndex = index + 1, segmentIndex = 0, segmentOffset = 0L, segmentsBefore = done) }
+        }
+
+        currentCoroutineContext().ensureActive()
+        progress(id) { it.copy(phase = TransferPhase.PROCESSING, bytesPerSecond = 0L) }
+        refreshNotification(force = true)
+        val files = tracks.indices.map { DownloadCoordinator.trackFile(this, id, it) }
+        val output = DownloadCoordinator.trackFile(this, id, DownloadCoordinator.OUTPUT_TRACK)
+        val job = currentCoroutineContext()[Job]
+        val merged = try {
+            output to MediaRemuxer.remux(files, output) { job?.isActive == false }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            Log.w(TAG, "Merging tracks failed for $id", failure)
+            null
+        }
+        if (merged != null) {
+            publish(id, merged.first, meter.received, merged.second)
+        } else {
+            // Keep what was downloaded rather than failing: the untouched stream, flagged when its audio is missing.
+            val note = if (files.size > 1) "Saved without audio: the audio track couldn't be merged." else null
+            publish(id, files.first(), meter.received, tracks.first().mime ?: MediaFiles.resolveMime(item.streamType, item.sourceUrl, item.mimeType), note)
+        }
+    }
+
+    /** Fetches one complete file, resuming a partial one with a Range request. */
+    private suspend fun fetchWholeFile(url: String, headers: Map<String, String>, file: File, id: String, meter: SpeedMeter) {
+        val resumeFrom = file.length()
+        val connection = openConnection(url, headers).apply { if (resumeFrom > 0) setRequestProperty("Range", "bytes=$resumeFrom-") }
+        val disconnectOnCancel = currentCoroutineContext()[Job]?.invokeOnCompletion { connection.disconnect() }
+        try {
+            val code = connection.responseCode
+            if (code == 416 && resumeFrom > 0) { meter.received += resumeFrom; return }
+            if (code !in 200..299) throw HttpStatusException(code)
+            val append = code == HttpURLConnection.HTTP_PARTIAL && resumeFrom > 0
+            if (append) meter.received += resumeFrom else file.delete()
+            connection.inputStream.use { input -> FileOutputStream(file, append).buffered(BUFFER_SIZE).use { pump(input, it, id, meter) } }
+        } finally {
+            disconnectOnCancel?.dispose()
+            connection.disconnect()
+        }
+    }
+
+    /** Appends init + media segments in order, checkpointing after each; a restart truncates to the last checkpoint. */
+    private suspend fun fetchSegments(track: Track, headers: Map<String, String>, file: File, id: String, meter: SpeedMeter, startSegment: Int, checkpointOffset: Long) {
+        val resume = startSegment in 1..track.urls.size && file.length() >= checkpointOffset
+        if (resume) RandomAccessFile(file, "rw").use { it.setLength(checkpointOffset) } else file.delete()
+        if (resume) meter.received += checkpointOffset
+        FileOutputStream(file, resume).buffered(BUFFER_SIZE).use { output ->
+            if (!resume) track.initUrl?.let { fetchInto(it, headers, output, id, meter, "The initialization segment") }
+            for (index in (if (resume) startSegment else 0) until track.urls.size) {
                 currentCoroutineContext().ensureActive()
-                val connection = openConnection(segments[index], item.requestHeaders)
-                val disconnectOnCancel = currentCoroutineContext()[Job]?.invokeOnCompletion { connection.disconnect() }
-                try {
-                    val code = connection.responseCode
-                    if (code !in 200..299) throw HttpStatusException(code, "Segment ${index + 1} returned HTTP $code")
-                    connection.inputStream.use { pump(it, output, id, meter) }
-                } finally {
-                    disconnectOnCancel?.dispose()
-                    connection.disconnect()
-                }
+                fetchInto(track.urls[index], headers, output, id, meter, "Segment ${index + 1}")
                 output.flush()
-                val offset = meter.received
-                progress(id) { it.copy(segmentIndex = index + 1, segmentOffset = offset, downloadedBytes = offset) }
+                val offset = file.length()
+                val received = meter.received
+                progress(id) { it.copy(segmentIndex = index + 1, segmentOffset = offset, downloadedBytes = received) }
             }
         }
-        publish(id, part, meter.received)
+    }
+
+    private suspend fun fetchInto(url: String, headers: Map<String, String>, output: OutputStream, id: String, meter: SpeedMeter, what: String) {
+        val connection = openConnection(url, headers)
+        val disconnectOnCancel = currentCoroutineContext()[Job]?.invokeOnCompletion { connection.disconnect() }
+        try {
+            val code = connection.responseCode
+            if (code !in 200..299) throw HttpStatusException(code, "$what returned HTTP $code")
+            connection.inputStream.use { pump(it, output, id, meter) }
+        } finally {
+            disconnectOnCancel?.dispose()
+            connection.disconnect()
+        }
+    }
+
+    /** Download + merged copy + the copy into shared storage must fit, with headroom left for the system. */
+    private fun ensureFreeSpace(item: DownloadItem) {
+        val expected = item.totalBytes ?: item.estimatedBytes ?: return
+        val remaining = (expected - item.downloadedBytes).coerceAtLeast(0L)
+        val copies = if (item.streamType == StreamType.DIRECT && item.audioKey == null) 1 else 2
+        val needed = remaining + expected * copies + SPACE_RESERVE_BYTES
+        val available = runCatching { StatFs(noBackupFilesDir.path).availableBytes }.getOrDefault(Long.MAX_VALUE)
+        if (available < needed) {
+            throw UnsupportedStreamException("Not enough free space: needs about ${needed.asReadableBytes()}, ${available.asReadableBytes()} available.")
+        }
     }
 
     private class SpeedMeter(var received: Long) {
@@ -257,16 +358,18 @@ class DownloadService : Service() {
         }
     }
 
-    private suspend fun publish(id: String, part: File, received: Long) {
+    private suspend fun publish(id: String, file: File, received: Long, mime: String? = null, note: String? = null) {
         currentCoroutineContext().ensureActive()
         progress(id) { it.copy(phase = TransferPhase.VERIFYING, downloadedBytes = received, bytesPerSecond = 0L) }
         refreshNotification()
         val item = DownloadCoordinator.find(id) ?: return
-        val destination = finalizeToMediaStore(item, part)
-        part.delete()
+        val finalMime = mime ?: MediaFiles.resolveMime(item.streamType, item.sourceUrl, item.mimeType)
+        val destination = finalizeToMediaStore(item, file, finalMime)
+        DownloadCoordinator.deleteParts(this, id)
         DownloadCoordinator.update(id) {
             if (it.phase == TransferPhase.CANCELLED) it
-            else it.copy(phase = TransferPhase.COMPLETED, downloadedBytes = received, totalBytes = it.totalBytes ?: received, destination = destination, bytesPerSecond = 0L, error = null)
+            else it.copy(phase = TransferPhase.COMPLETED, downloadedBytes = received, totalBytes = it.totalBytes ?: received, destination = destination,
+                bytesPerSecond = 0L, error = note, mimeType = finalMime)
         }
     }
 
@@ -289,13 +392,7 @@ class DownloadService : Service() {
             if (headers.keys.none { it.equals("User-Agent", ignoreCase = true) }) setRequestProperty("User-Agent", "Fetch/1.0 Android")
         }
 
-    private fun HttpURLConnection.useText(): String = try {
-        if (responseCode !in 200..299) throw HttpStatusException(responseCode)
-        inputStream.bufferedReader().use { it.readText() }
-    } finally { disconnect() }
-
-    private fun finalizeToMediaStore(item: DownloadItem, file: File): String {
-        val mime = MediaFiles.resolveMime(item.streamType, item.sourceUrl, item.mimeType)
+    private fun finalizeToMediaStore(item: DownloadItem, file: File, mime: String): String {
         val name = MediaFiles.displayName(item.title, mime)
         val downloads = MediaStore.Downloads.EXTERNAL_CONTENT_URI to "${Environment.DIRECTORY_DOWNLOADS}/Fetch"
         val (collection, directory) = when (MediaFiles.kindOf(mime)) {
@@ -431,5 +528,6 @@ class DownloadService : Service() {
         private const val MAX_RETRIES = 3
         private const val RETRY_BASE_DELAY_MS = 2_000L
         private const val TAG = "FetchDownload"
+        private const val SPACE_RESERVE_BYTES = 200L * 1024 * 1024
     }
 }

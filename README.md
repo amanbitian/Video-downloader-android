@@ -15,16 +15,21 @@
 * **Share links into Fetch** from any app, open http(s) links with it, and get offered a link you just copied.
 
 ### 2. Media Discovery
-* Sniffs media requests (`.mp4`, `.webm`, `.m3u8`, `.mpd`, audio…) in `shouldInterceptRequest()` after a static-asset pre-filter.
+* Sniffs media requests (`.mp4`, `.webm`, `.m3u8`, `.mpd`, audio…) from pages **and service workers** through one pipeline, after a static-asset pre-filter.
+* **One video, several qualities:** HLS/DASH manifests become one entry with a row per resolution (codec, bitrate, `~size` from bitrate × duration). Files a manifest owns — its playlists, segments and byte-range slices fetched by streaming (MSE) players — are absorbed instead of listed as separate videos. Files named by quality (`clip_480p.mp4`, `clip_1080p.mp4`) and alternative `<source>` formats of one `<video>` are grouped the same way.
+* **Page isolation:** every page is a session; lookups for the previous page are cancelled, and any result that still arrives is committed only if its session is current (checked under the state lock).
 * Injected script reports `<video>`/`<audio>` sources when they load or start playing.
 * Extension-less media (requests sent with `Range: bytes=0-`) is confirmed with a HEAD / one-byte probe of its `Content-Type`.
 * Any file the page offers as a download (PDF, ZIP, images, …) opens the download sheet directly.
-* Candidates carry the page's real User-Agent, Referer and cookies, are named after the page (`og:title`), and show their size.
+* Candidates carry the page's real User-Agent, Referer and cookies, are named after the page (`og:title`, with site suffixes like " - YouTube" removed conservatively), and show a thumbnail (`og:image` or the video poster).
+* DRM (`ContentProtection`, HLS keys) and live streams are reported in the sheet up front instead of failing mid-download.
 * YouTube is blocked, as Google Play requires.
 
 ### 3. Download Engine (`DownloadService` & `DownloadCoordinator`)
 * **Validated resume:** `.part` files in no-backup storage, `Range` + `If-Range` (ETag / Last-Modified) so a changed file is never appended to; HTTP 416 handled.
-* **HLS:** unencrypted TS playlists, checkpointed after every segment so an interrupted download resumes mid-stream. Variants that carry no audio are labelled.
+* **HLS & DASH:** TS and fMP4 segments, byte-range single-file playlists, SegmentTemplate (`$Number$`/`$Time$`, timelines), SegmentList and single-file representations — checkpointed after every segment so an interrupted download resumes mid-stream.
+* **Separate audio is merged:** video and the chosen audio (main track, default or device language, a codec that fits the container) are downloaded as separate tracks and combined with `MediaMuxer` into MP4 (H.264/H.265 + AAC) or WebM (VP8/VP9 + Opus/Vorbis) — no re-encoding. HLS `.ts` output is converted to MP4 the same way.
+* **Free-space check** before large downloads (download + merge + shared-storage copy); orphaned temp files are swept on start.
 * **Automatic retries** with exponential backoff for network errors and 5xx/408/429.
 * **Queue:** configurable simultaneous downloads (1–5), queued items shown as such, optional Wi-Fi-only.
 * **State survives process death**, including request headers, so paused downloads can resume after a restart.
@@ -33,7 +38,7 @@
 
 ### 4. Library & Player
 * Downloads list with thumbnails, type filters, open, share, remove, delete file, and clear finished.
-* Built-in Media3 (ExoPlayer) player for video and audio, including HLS `.ts` output; formats it can't decode are handed to another app.
+* Built-in Media3 (ExoPlayer) player for video and audio; formats it can't decode are handed to another app.
 
 ### 5. Settings
 * Simultaneous downloads, Wi-Fi only, light/dark/system theme, clear browsing data.
@@ -41,7 +46,7 @@
 ---
 
 ## ⚠️ Not supported yet
-DASH downloads · fMP4 / AES-128 HLS · muxing separate HLS audio · converting `.ts` to `.mp4` · multi-connection downloads · password-protected private folder · SD-card location picker · `blob:`/MediaSource-only players.
+DRM-protected or AES-128-encrypted streams · live streams · DASH beyond the first period · AV1 · subtitles · multi-connection downloads · password-protected private folder · SD-card location picker · players whose only source is a `blob:` URL with no fetchable manifest.
 
 ---
 

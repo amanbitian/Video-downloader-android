@@ -29,10 +29,14 @@ object MediaFiles {
 
     /** Picks the first specific MIME type from [declared] (e.g. candidate hint, then server Content-Type), else infers from the URL. */
     fun resolveMime(streamType: StreamType, url: String, vararg declared: String?): String {
-        if (streamType == StreamType.HLS) return "video/mp2t"
+        // Manifest types describe the playlist, not the media saved from it.
         val specific = declared.asSequence().map { it.orEmpty().substringBefore(';').trim().lowercase() }
-            .firstOrNull { it !in genericMimes && '/' in it && ',' !in it && "mpegurl" !in it }
-        return specific ?: mimeByExtension[extensionOf(url)] ?: "application/octet-stream"
+            .firstOrNull { it !in genericMimes && '/' in it && ',' !in it && "mpegurl" !in it && "dash+xml" !in it }
+        return when (streamType) {
+            StreamType.HLS -> specific ?: "video/mp2t"
+            StreamType.DASH -> specific ?: "video/mp4"
+            StreamType.DIRECT -> specific ?: mimeByExtension[extensionOf(url)] ?: "application/octet-stream"
+        }
     }
 
     /** Null for types we don't know; MediaStore then appends the right extension itself rather than a wrong guess. */
