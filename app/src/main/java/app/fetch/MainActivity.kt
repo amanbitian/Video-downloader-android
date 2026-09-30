@@ -17,6 +17,8 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -74,6 +76,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -477,51 +480,70 @@ private fun BrowserEmptyState(onOpen: (String) -> Unit) {
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 private fun BrowserView(url: String, onTitle: (String) -> Unit, onDetected: (MediaCandidate) -> Unit) {
+    var webViewGeneration by remember { mutableIntStateOf(0) }
     val webViewBundle = remember { Bundle() }
-    AndroidView(factory = { context ->
-        WebView(context).apply {
-            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            settings.mediaPlaybackRequiresUserGesture = true
-            webChromeClient = WebChromeClient()
-            webViewClient = object : WebViewClient() {
-                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) { if (!url.isNullOrBlank()) onTitle(url.removePrefix("https://").removePrefix("http://").substringBefore('/')) }
-                override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                    val urlStr = request?.url?.toString() ?: return super.shouldInterceptRequest(view, request)
-                    val lowered = urlStr.lowercase()
-                    if (lowered.contains(".mp4") || lowered.contains(".m3u8") || lowered.contains(".mpd") || lowered.contains(".webm") ||
-                        lowered.contains(".m4a") || lowered.contains(".mp3") || lowered.contains("video/") || lowered.contains("audio/")) {
-                        val acceptHeader = request.requestHeaders?.get("Accept")
-                        val defaultTitle = urlStr.substringBefore('?').substringAfterLast('/').ifBlank { "Detected media" }
-                        onDetected(browserCandidate(urlStr, defaultTitle, acceptHeader, "Fetch/1.0 Android", view?.url))
+    val lastRequestedUrl = remember { AtomicReference<String?>(null) }
+    val isRendererGone = remember { AtomicBoolean(false) }
+
+    key(webViewGeneration) {
+        AndroidView(factory = { context ->
+            WebView(context).apply {
+                layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.mediaPlaybackRequiresUserGesture = true
+                webChromeClient = WebChromeClient()
+                webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                        if (!url.isNullOrBlank()) onTitle(url.removePrefix("https://").removePrefix("http://").substringBefore('/'))
                     }
-                    return super.shouldInterceptRequest(view, request)
+                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                        val urlStr = request?.url?.toString() ?: return super.shouldInterceptRequest(view, request)
+                        if (isCandidateUrl(urlStr)) {
+                            val acceptHeader = request.requestHeaders?.get("Accept")
+                            val defaultTitle = urlStr.substringBefore('?').substringAfterLast('/').ifBlank { "Detected media" }
+                            onDetected(browserCandidate(urlStr, defaultTitle, acceptHeader, "Fetch/1.0 Android", url))
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+                    override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                        isRendererGone.set(true)
+                        webViewGeneration++
+                        return true
+                    }
                 }
-                override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
-                    view?.reload()
-                    return true
+                setDownloadListener(DownloadListener { detectedUrl, userAgent, contentDisposition, mimeType, _ ->
+                    val title = Regex("filename=\\\"?([^;\\\"]+)").find(contentDisposition.orEmpty())?.groupValues?.getOrNull(1) ?: detectedUrl.substringBefore('?').substringAfterLast('/').ifBlank { "media" }
+                    onDetected(browserCandidate(detectedUrl, title, mimeType, userAgent, url))
+                })
+                if (!webViewBundle.isEmpty && !isRendererGone.get()) {
+                    restoreState(webViewBundle)
+                } else if (url.isNotBlank()) {
+                    lastRequestedUrl.set(url)
+                    loadUrl(url)
                 }
             }
-            setDownloadListener(DownloadListener { detectedUrl, userAgent, contentDisposition, mimeType, _ ->
-                val title = Regex("filename=\\\"?([^;\\\"]+)").find(contentDisposition.orEmpty())?.groupValues?.getOrNull(1) ?: detectedUrl.substringBefore('?').substringAfterLast('/').ifBlank { "media" }
-                onDetected(browserCandidate(detectedUrl, title, mimeType, userAgent, url))
-            })
-            if (!webViewBundle.isEmpty) {
-                restoreState(webViewBundle)
-            } else if (url.isNotBlank()) {
-                loadUrl(url)
+        }, update = { webView ->
+            if (url.isNotBlank() && lastRequestedUrl.getAndSet(url) != url) {
+                webView.loadUrl(url)
             }
-        }
-    }, update = { webView ->
-        if (webView.url != url && url.isNotBlank()) {
-            webView.loadUrl(url)
-        }
-    }, modifier = Modifier.fillMaxSize(),
-    onRelease = { webView ->
-        webView.saveState(webViewBundle)
-        webView.destroy()
-    })
+        }, modifier = Modifier.fillMaxSize(),
+        onRelease = { webView ->
+            if (!isRendererGone.get()) {
+                runCatching { webView.saveState(webViewBundle) }
+            }
+            runCatching { webView.destroy() }
+        })
+    }
+}
+
+private fun isCandidateUrl(url: String): Boolean {
+    val u = url.lowercase()
+    if (u.endsWith(".ts") || u.contains(".ts?") || u.endsWith(".m4s") || u.contains(".m4s?") ||
+        u.endsWith(".css") || u.endsWith(".js") || u.endsWith(".png") || u.endsWith(".jpg") || u.endsWith(".jpeg") || u.endsWith(".ico")) {
+        return false
+    }
+    return u.contains(".mp4") || u.contains(".webm") || u.contains(".m3u8") || u.contains(".mpd") || u.contains(".m4a") || u.contains(".mp3") || u.contains("video/") || u.contains("audio/")
 }
 
 @Composable
