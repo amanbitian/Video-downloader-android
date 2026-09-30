@@ -48,11 +48,16 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -89,6 +94,7 @@ import app.fetch.download.DownloadCoordinator
 import app.fetch.download.DownloadItem
 import app.fetch.download.DownloadService
 import app.fetch.download.MediaCandidate
+import app.fetch.download.MediaVariant
 import app.fetch.download.TransferPhase
 import app.fetch.download.StreamType
 import app.fetch.download.asReadableBytes
@@ -100,9 +106,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            Log.e("FetchCrash", "Uncaught exception on thread ${thread.name}", throwable)
-        }
         DownloadCoordinator.initialize(applicationContext)
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         setContent { FetchTheme { FetchApp() } }
@@ -124,7 +127,7 @@ private fun FetchApp() {
     val downloads by DownloadCoordinator.downloads.collectAsStateWithLifecycle()
     val candidates by DownloadCoordinator.candidates.collectAsStateWithLifecycle()
     var tab by remember { mutableIntStateOf(0) }
-    var showCandidate by remember { mutableStateOf<MediaCandidate?>(null) }
+    var showDownloadSheet by remember { mutableStateOf(false) }
 
     Scaffold(
         containerColor = Canvas,
@@ -139,18 +142,26 @@ private fun FetchApp() {
         Box(Modifier.padding(padding).fillMaxSize()) {
             when (tab) {
                 0 -> BrowserScreen(
+                    candidates = candidates,
                     onDetected = { DownloadCoordinator.detect(it) },
-                    candidateCount = candidates.size,
-                    onOpenDetected = { showCandidate = candidates.lastOrNull() }
+                    onOpenDownloadSheet = { showDownloadSheet = true }
                 )
                 1 -> DownloadsScreen(downloads)
                 else -> SettingsScreen()
             }
         }
     }
-    showCandidate?.let { original ->
-        val candidate = candidates.firstOrNull { it.url == original.url } ?: original
-        CandidateDialog(candidate, onDownload = { DownloadCoordinator.enqueue(context, candidate); showCandidate = null }, onDismiss = { DownloadCoordinator.dismissCandidate(candidate.url); showCandidate = null })
+
+    if (showDownloadSheet && candidates.isNotEmpty()) {
+        DownloadBottomSheet(
+            candidates = candidates,
+            onDismiss = { showDownloadSheet = false },
+            onDownload = { candidate, variant ->
+                DownloadCoordinator.enqueue(context, candidate, variant)
+                DownloadCoordinator.dismissCandidate(candidate.url)
+                showDownloadSheet = false
+            }
+        )
     }
 }
 
@@ -162,7 +173,11 @@ data class TabItem(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun BrowserScreen(onDetected: (MediaCandidate) -> Unit, candidateCount: Int, onOpenDetected: () -> Unit) {
+private fun BrowserScreen(
+    candidates: List<MediaCandidate>,
+    onDetected: (MediaCandidate) -> Unit,
+    onOpenDownloadSheet: () -> Unit
+) {
     var tabs by remember { mutableStateOf(listOf(TabItem())) }
     var activeTabId by remember { mutableStateOf(tabs.first().id) }
     var showTabSwitcher by remember { mutableStateOf(false) }
@@ -252,16 +267,31 @@ private fun BrowserScreen(onDetected: (MediaCandidate) -> Unit, candidateCount: 
                 )
             }
         }
-        if (candidateCount > 0) {
-            Surface(
-                modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp).fillMaxWidth().clickable(onClick = onOpenDetected),
-                color = Ink, contentColor = Color.White, shape = RoundedCornerShape(14.dp), shadowElevation = 3.dp
+
+        // Native Floating Action Button layered above WebView
+        if (candidates.isNotEmpty()) {
+            FloatingActionButton(
+                onClick = onOpenDownloadSheet,
+                containerColor = Blue,
+                contentColor = Color.White,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(20.dp)
             ) {
-                Row(Modifier.padding(horizontal = 18.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Download, null)
-                    Spacer(Modifier.width(12.dp))
-                    Text("$candidateCount ${if (candidateCount == 1) "media file" else "media files"} detected", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                    Text("View")
+                BadgedBox(
+                    badge = {
+                        if (candidates.size > 1) {
+                            Badge(containerColor = Ink, contentColor = Color.White) {
+                                Text(candidates.size.toString())
+                            }
+                        }
+                    }
+                ) {
+                    Icon(
+                        Icons.Default.Download,
+                        contentDescription = "Download video"
+                    )
                 }
             }
         }
@@ -295,6 +325,79 @@ private fun BrowserScreen(onDetected: (MediaCandidate) -> Unit, candidateCount: 
             },
             onDismiss = { showTabSwitcher = false }
         )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DownloadBottomSheet(
+    candidates: List<MediaCandidate>,
+    onDismiss: () -> Unit,
+    onDownload: (MediaCandidate, MediaVariant?) -> Unit
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(24.dp)
+        ) {
+            Text("Download video", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(16.dp))
+
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.heightIn(max = 400.dp)) {
+                items(candidates, key = { it.url }) { candidate ->
+                    Surface(
+                        color = Color(0xFFF7F8FA),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text(candidate.title, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Spacer(Modifier.height(8.dp))
+
+                            when {
+                                candidate.streamType == StreamType.HLS && candidate.variants.isEmpty() -> {
+                                    Text("Resolving available qualities…", color = Color(0xFF626873), fontSize = 13.sp)
+                                }
+                                candidate.streamType == StreamType.HLS -> {
+                                    candidate.variants.forEach { variant ->
+                                        Row(
+                                            Modifier
+                                                .fillMaxWidth()
+                                                .clickable { onDownload(candidate, variant); onDismiss() }
+                                                .padding(vertical = 8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(Modifier.weight(1f)) {
+                                                Text(variant.label, fontWeight = FontWeight.SemiBold, color = Blue)
+                                                Text(variant.detail, color = Color(0xFF626873), fontSize = 12.sp)
+                                            }
+                                            Icon(Icons.Default.Download, "Download", tint = Blue)
+                                        }
+                                        HorizontalDivider(color = Color(0xFFE8E9EC))
+                                    }
+                                }
+                                candidate.streamType == StreamType.DASH -> {
+                                    Text("DASH streams are detected but not supported yet.", color = Color(0xFF626873), fontSize = 13.sp)
+                                }
+                                else -> {
+                                    Button(
+                                        onClick = { onDownload(candidate, null); onDismiss() },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = ButtonDefaults.buttonColors(containerColor = Blue)
+                                    ) {
+                                        Icon(Icons.Default.Download, null, Modifier.size(18.dp))
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("Download Direct Stream")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(24.dp))
+        }
     }
 }
 
