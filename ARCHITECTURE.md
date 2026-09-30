@@ -1,109 +1,100 @@
 # Architecture Documentation: Fetch
 
-This document provides a comprehensive technical overview of the architecture, data flows, threading model, and lifecycle management in **Fetch**.
+This document provides a technical overview of the architecture, data flows, threading model, and lifecycle management in **Fetch**.
 
 ---
 
 ## 🏛️ System Architecture Overview
 
-Fetch is designed around a clean separation of concerns between the **Browser UI**, the **Media Discovery & Resolution Pipeline**, the **Download Coordinator**, and the **Background Transfer Engine**.
+Fetch is organised around a clean separation between the **Browser**, the **Media Discovery Pipeline**, the **Download Coordinator**, the **Background Transfer Engine** and the **Library/Player**.
 
 ```
                          ┌────────────────────────────────┐
                          │      Jetpack Compose UI        │
-                         │ BrowserScreen + BottomSheet FAB │
+                         │ Browser · Downloads · Settings │
                          └───────────────┬────────────────┘
                                          │
                                          ▼
                          ┌────────────────────────────────┐
-                         │         BrowserView            │
-                         │    WebView + WebViewClient     │
+                         │       BrowserController        │
+                         │  one WebView per tab + clients │
                          └───────────────┬────────────────┘
                                          │
-                         [Network Request Interception]
-                                         │
-                                         ▼
-                         ┌────────────────────────────────┐
-                         │       Media Pre-Filter         │
-                         │   isCandidateUrl() / .svg filter│
-                         └───────────────┬────────────────┘
-                                         │
-                                         ▼
-                         ┌────────────────────────────────┐
-                         │       Media Discovery          │
-                         │   DownloadCoordinator.detect() │
-                         └───────────────┬────────────────┘
-                                         │
-             ┌───────────────────────────┴───────────────────────────┐
-             │                                                       │
-             ▼                                                       ▼
-    ┌─────────────────┐                                     ┌─────────────────┐
-    │   HlsResolver   │                                     │  Direct Stream  │
-    │  (Master M3U8)  │                                     │   (MP4 / WebM)  │
-    └────────┬────────┘                                     └────────┬────────┘
-             │                                                       │
-             └───────────────────────────┬───────────────────────────┘
-                                         │
+        ┌────────────────────────────────┼────────────────────────────────┐
+        ▼                                ▼                                ▼
+ ┌──────────────┐              ┌──────────────────┐              ┌──────────────────┐
+ │ Request sniff│              │ <video> JS bridge│              │ DownloadListener │
+ │ (pre-filter) │              │ (play / metadata)│              │ + long-press menu│
+ └──────┬───────┘              └────────┬─────────┘              └────────┬─────────┘
+        └────────────────────────────────┼────────────────────────────────┘
                                          ▼
                          ┌────────────────────────────────┐
                          │      DownloadCoordinator       │
+                         │ candidates · probe · HLS parse │
                          │  StateFlow<List<DownloadItem>> │
                          └───────────────┬────────────────┘
-                                         │
-                         [Foreground Service Intent]
-                                         │
+                                         │  startForegroundService(action, id)
                                          ▼
                          ┌────────────────────────────────┐
                          │        DownloadService         │
-                         │    Foreground Service (FGS)    │
+                         │ queue · retries · notifications│
                          └───────────────┬────────────────┘
-                                         │
              ┌───────────────────────────┴───────────────────────────┐
-             │                                                       │
              ▼                                                       ▼
-    ┌─────────────────┐                                     ┌─────────────────┐
-    │ Direct Downloader│                                    │  Hls Downloader │
-    │ (Range Resumable│                                    │ (Segment Order) │
-    └────────┬────────┘                                     └────────┬────────┘
-             │                                                       │
+    ┌──────────────────┐                                    ┌──────────────────┐
+    │ Direct transfer  │                                    │  HLS transfer    │
+    │ Range + If-Range │                                    │ segment checkpts │
+    └────────┬─────────┘                                    └────────┬─────────┘
              └───────────────────────────┬───────────────────────────┘
-                                         │
-                         [Cache .part file buffering]
-                                         │
-                                         ▼
+                                         ▼  no_backup/parts/<id>.part
                          ┌────────────────────────────────┐
                          │      MediaStore Publisher      │
-                         │    Movies/Fetch & Music/Fetch  │
+                         │ Movies · Music · Pictures ·    │
+                         │ Download  (…/Fetch)            │
+                         └───────────────┬────────────────┘
+                                         ▼
+                         ┌────────────────────────────────┐
+                         │  Downloads list · PlayerActivity│
                          └────────────────────────────────┘
 ```
 
 ---
 
-## 🔍 Detailed Component Breakdown
+## 🔍 Component Breakdown
 
-### 1. Browser & UI Layer (`MainActivity.kt`)
-* **`FetchApp`**: Root Composable managing top-level navigation tabs (`Browse`, `Downloads`, `Settings`), active candidate observation, and the quality picker bottom sheet (`DownloadBottomSheet`).
-* **`BrowserScreen`**: Manages multiple browser tabs (`TabItem`), active tab navigation, tab switcher dialog (`TabSwitcherDialog`), address bar, and the native floating action button (`FloatingActionButton` with candidate badge count).
-* **`BrowserView`**: Wraps native Android `WebView` via `AndroidView`. Implements:
-  * **WebView Generation Keying (`webViewGeneration` + `key(...)`)**: Guarantees that upon renderer death (`onRenderProcessGone`), the dead instance is discarded and a pristine WebView is recreated.
-  * **Reload Loop Protection**: Uses `lastRequestedUrl` (`AtomicReference`) to prevent server redirect feedback loops from repeatedly calling `loadUrl()`.
-  * **State Preservation**: Saves and restores WebView bundle state (`saveState` / `restoreState`) across tab switches and memory recreation, while ensuring dead WebViews never execute `saveState()`.
+### 1. App shell (`MainActivity.kt`, `ui/`)
+* **`MainActivity`** owns the `BrowserController` for its lifetime, handles `ACTION_SEND` / `ACTION_VIEW` intents and the "open copied link?" prompt, and declares `configChanges` so rotation never tears down tabs or fullscreen video.
+* **`FetchApp`** hosts the Browse / Downloads / Settings screens, the download sheet (also opened by `DownloadCoordinator.sheetRequests` for explicit downloads), system Back handling and the fullscreen video overlay.
+* **`ui/`**: `DownloadSheet`, `DownloadsScreen` (thumbnails, filters, row actions), `SettingsScreen`, `Theme` (light/dark).
 
-### 2. Media Discovery & Pre-Filtering Pipeline (`DownloadCoordinator.kt` & `HlsResolver.kt`)
-* **Thread-Safe Interception**: `shouldInterceptRequest()` operates on worker threads and avoids accessing UI-thread properties (`view?.url`).
-* **Pre-Filtering (`isCandidateUrl`)**: Instantly drops non-media requests (`.svg`, `.png`, `.jpg`, `.webp`, `.ico`, `.css`, `.js`, `.ts`, `.m4s`, analytics, favicons) before evaluation.
-* **Candidate StateFlow**: Emits detected `MediaCandidate` objects thread-safely via `synchronized(stateLock)` and `MutableStateFlow`.
-* **HlsResolver**: Fetches HLS master manifests (`.m3u8`), verifies encryption status (`#EXT-X-KEY`), checks for fMP4 compatibility, and parses quality variants (`1080p`, `720p`, etc.) into absolute URLs.
+### 2. Browser (`browser/`)
+* **`BrowserController`** keeps one `WebView` per tab, created lazily, so switching tabs or screens never reloads a page. It implements the WebView clients: navigation state, fullscreen (`onShowCustomView`), tapped pop-ups as new tabs (`onCreateWindow`), file chooser, external-app links (only on a user gesture, with component/selector stripped), long-press menu, desktop mode, and renderer-death recovery (the dead WebView is replaced and the tab's `generation` bumped).
+* **`BrowserStore`** persists tabs, bookmarks and history in `SharedPreferences`.
+* **`BrowserScreen`** is the Compose UI: address bar, progress bar, navigation toolbar, home page, tab switcher, bookmarks/history dialog, link menu.
+* **`UrlUtils`**: address normalisation, URL extraction from shared text, host parsing, source blocklist, request pre-filter.
 
-### 3. Download Coordinator & State Machine (`DownloadCoordinator.kt`)
-* **State Persistence**: Serializes download items to JSON and persists snapshots debounced via `SharedPreferences`.
-* **Interrupted State Recovery**: Automatically transitions active/queued transfers into `PAUSED` state on initialization (`initialize()`), displaying *"Download interrupted. Tap retry to resume."* rather than hiding unfinished work.
+### 3. Media Discovery (`BrowserController` → `DownloadCoordinator`, `HlsResolver`, `MediaProbe`)
+* Each visible page gets a **session**; media reported for an old page, a background tab or the page just left is dropped.
+* **Sources:** URL-sniffed sub-resources; the injected `<video>`/`<audio>` script (`FetchMedia` bridge); `Range: bytes=0-` requests confirmed by `MediaProbe`; explicit downloads from `DownloadListener` or the long-press menu.
+* **Headers** replay what the page sent (real User-Agent, Referer, Origin) plus cookies from `CookieManager`.
+* **`HlsResolver`** parses master playlists (quoted attributes, separate-audio detection) and media playlists (absolute segment URLs; rejects encrypted, fMP4 and byte-range streams with readable errors).
 
-### 4. Background Transfer Engine (`DownloadService.kt`)
-* **Foreground Service Safety**: Guarantees immediate `startForeground()` invocation synchronously upon service start to comply with Android 12+ FGS start requirements.
-* **Range-Based Resumable Downloads**: Checks for existing `.part` files in `cacheDir`, sets HTTP `Range: bytes=X-` headers, and appends incoming stream chunks.
-* **Throttled Progress & Notifications**: Throttles progress calculations, UI updates, and foreground notification refreshes to `1,000ms` (1 second), avoiding main-thread starvation and ANRs.
-* **MediaStore Finalization**: Inserts completed media into `MediaStore.Video.Media` or `MediaStore.Audio.Media` using pending-file semantics (`IS_PENDING = 1`), writes the file stream, and marks it active (`IS_PENDING = 0`).
+### 4. Download Coordinator (`DownloadCoordinator.kt`)
+* Single source of truth for downloads and candidates (`StateFlow`), guarded by `stateLock`.
+* Persists every item (including request headers, validator and HLS checkpoint) to JSON; phase changes persist immediately, progress is debounced.
+* On start, running items become `PAUSED` ("Download interrupted. Tap retry to resume.") and legacy `cacheDir` parts are migrated.
+
+### 5. Transfer Engine (`DownloadService.kt`)
+* **Foreground-service contract:** every `onStartCommand` calls `startForeground()` first, since every command arrives via `startForegroundService()`. The service stops itself with `stopSelfResult()` once nothing is queued or running. `onTimeout` (Android 15 `dataSync` limit) pauses cleanly.
+* **Queue:** a `Semaphore` sized from settings; waiting items are `QUEUED`.
+* **Direct:** `Range: bytes=N-` + `If-Range`; a 200 reply means the file changed, so the download restarts; 416 at full length is treated as complete.
+* **HLS:** segments appended in order; after each one the byte offset and index are checkpointed, so a retry truncates to the last checkpoint and continues.
+* **Retries:** up to 3 with exponential backoff for I/O errors and 5xx/408/429.
+* **Publishing:** `MediaFiles` resolves the real MIME type (declared → `Content-Type` → extension) and file name; the file is inserted as pending into the matching MediaStore collection (falling back to Downloads), copied, then published.
+
+### 6. Library & Player
+* **`MediaActions`**: open (player for audio/video, chooser otherwise), share, delete, thumbnails.
+* **`PlayerActivity`**: Media3 ExoPlayer with position saved across recreation; unplayable formats are handed to another app.
 
 ---
 
@@ -111,17 +102,19 @@ Fetch is designed around a clean separation of concerns between the **Browser UI
 
 | Component | Execution Thread | Concurrency Primitive |
 |---|---|---|
-| **WebView UI / Navigation** | Main (UI) Thread | Jetpack Compose Recomposition & StateFlow |
-| **`shouldInterceptRequest()`** | Worker Thread Pool | Thread-safe `AtomicReference` & SharedFlow |
-| **Media Resolution / Parsing** | `Dispatchers.IO` | Coroutines (`withContext(Dispatchers.IO)`) |
-| **Download Transfers** | `Dispatchers.IO` | `Semaphore` (Max 3 concurrent transfers) |
-| **State Updates / Persistence** | `Dispatchers.IO` (Debounced) | `synchronized(stateLock)` & `SharedPreferences` |
+| **Compose UI, `BrowserController`, WebView clients** | Main thread | Compose snapshot state |
+| **`shouldInterceptRequest()`, JS bridge** | WebView worker / binder threads | `AtomicReference` / `@Volatile` tab fields only |
+| **HLS parsing, probes** | `Dispatchers.IO`, cancelled per page session | `SupervisorJob` per session |
+| **Transfers** | `Dispatchers.IO` | `Semaphore` (1–5 slots), `ConcurrentHashMap` of jobs |
+| **State & persistence** | Any → `Dispatchers.IO` (debounced) | `synchronized(stateLock)`, `StateFlow` |
 
 ---
 
 ## 🛡️ Crash Prevention & Fault Tolerance
 
-1. **Renderer Crash Isolation**: `onRenderProcessGone` intercepts Chromium renderer crashes and safely recreates the WebView instance.
-2. **Infinite Redirect Protection**: `lastRequestedUrl` comparison prevents `AndroidView.update` from re-triggering `loadUrl()` on server redirects.
-3. **Clipboard Crash Guard**: Verifies `primaryClip != null && itemCount > 0` before reading clipboard contents.
-4. **Header Null Safety**: Uses safe calls (`?.`) on `request.requestHeaders` to prevent `NullPointerException` on specific Android WebView sub-resource requests.
+1. **Foreground-service timing:** `startForeground()` runs synchronously at the top of every `onStartCommand`.
+2. **Renderer crash isolation:** `onRenderProcessGone` replaces only the affected tab's WebView.
+3. **Worker-thread safety:** interception and bridge callbacks never read Compose state or WebView properties.
+4. **No stale resurrection:** worker progress updates apply only while an item is still running, so pause/cancel always win.
+5. **Storage safety:** partial files live in `noBackupFilesDir`, never purged by the system; a failed publish deletes its pending MediaStore row.
+6. **Clipboard guard:** only read on window focus, with null/empty checks.

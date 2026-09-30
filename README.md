@@ -1,32 +1,47 @@
 # Fetch: Modern Android Video Downloader & Browser
 
-**Fetch** is a production-grade, highly optimized Android application that combines a full-featured WebView browser with an intelligent media detection engine and a robust, resumable download manager.
+**Fetch** is an Android app that combines a full-featured WebView browser with a media detection engine, a resumable download manager and an offline player.
 
 ---
 
 ## 🚀 Core Features
 
-### 1. Modern Target UX
-* **Browse Normally:** Navigate any media site, social feed, or video platform.
-* **Native Floating Action Button (FAB):** When downloadable media is discovered, a native Compose FAB appears with a live badge count (`↓ N`).
-* **Quality Picker Bottom Sheet:** Tapping the FAB opens a `ModalBottomSheet` presenting clean, actionable download options (direct streams, HLS qualities, DASH streams).
-* **Multi-Tab Support:** Open, switch between, and close multiple browser tabs with independent navigation states.
-* **WebView State Preservation:** Seamlessly preserves browsing history, scroll position, and tab states across backgrounding and memory recreation using bundle serialization (`saveState` / `restoreState`).
+### 1. Browser
+* **Real tabs:** every tab keeps its own WebView, so switching tabs or screens never reloads a page or loses its back stack. Tabs survive process death and restarts.
+* **Navigation:** back / forward / reload / stop / home, page-load progress, system Back walks page history.
+* **Fullscreen video**, pop-up windows opened by a tap (untapped pop-ups are blocked), file uploads, desktop-site mode.
+* **Long-press menu** on links and images: open in new/background tab, download, copy, share.
+* **Home page** with site shortcuts and bookmarks; **bookmarks & history**.
+* **Share links into Fetch** from any app, open http(s) links with it, and get offered a link you just copied.
 
-### 2. Robust Media Discovery & Pre-Filtering Pipeline
-* **Aggressive Pre-Filtering:** Instantly discards non-media traffic (`.svg`, `.png`, `.jpg`, `.webp`, `.ico`, `.css`, `.js`, `.ts`, `.m4s`) in `shouldInterceptRequest()` before any UI recomposition occurs.
-* **Thread-Safe Interception:** Zero UI-thread property access (`view?.url`) on worker callback threads, ensuring absolute thread safety.
-* **Multi-Stream Support:** Detects and resolves Direct media files, HLS (`.m3u8`) master playlists with quality variant parsing, and DASH packaged streams.
+### 2. Media Discovery
+* Sniffs media requests (`.mp4`, `.webm`, `.m3u8`, `.mpd`, audio…) in `shouldInterceptRequest()` after a static-asset pre-filter.
+* Injected script reports `<video>`/`<audio>` sources when they load or start playing.
+* Extension-less media (requests sent with `Range: bytes=0-`) is confirmed with a HEAD / one-byte probe of its `Content-Type`.
+* Any file the page offers as a download (PDF, ZIP, images, …) opens the download sheet directly.
+* Candidates carry the page's real User-Agent, Referer and cookies, are named after the page (`og:title`), and show their size.
+* YouTube is blocked, as Google Play requires.
 
-### 3. Resumable Download Engine (`DownloadService` & `DownloadCoordinator`)
-* **Range-Based Resumable Transfers:** Downloads to temporary `.part` files supporting HTTP `Range` requests (`bytes=X-`), allowing seamless pause, resume, and recovery after app interruption or process death.
-* **State Machine & Persistence:** Tracks transfer phases (`QUEUED`, `CONNECTING`, `DOWNLOADING`, `PAUSED`, `VERIFYING`, `COMPLETED`, `FAILED`, `CANCELLED`) and persists state to `SharedPreferences`.
-* **MediaStore Publication:** Finalizes completed transfers directly into public media directories (`Movies/Fetch` or `Music/Fetch`) via `MediaStore` using pending-file semantics.
+### 3. Download Engine (`DownloadService` & `DownloadCoordinator`)
+* **Validated resume:** `.part` files in no-backup storage, `Range` + `If-Range` (ETag / Last-Modified) so a changed file is never appended to; HTTP 416 handled.
+* **HLS:** unencrypted TS playlists, checkpointed after every segment so an interrupted download resumes mid-stream. Variants that carry no audio are labelled.
+* **Automatic retries** with exponential backoff for network errors and 5xx/408/429.
+* **Queue:** configurable simultaneous downloads (1–5), queued items shown as such, optional Wi-Fi-only.
+* **State survives process death**, including request headers, so paused downloads can resume after a restart.
+* **Saved to shared storage** via MediaStore: `Movies/Fetch`, `Music/Fetch`, `Pictures/Fetch`, `Download/Fetch`, with the correct extension for the real content type.
+* **Notifications:** progress with Pause/Cancel, and completion/failure alerts that open the Downloads screen.
 
-### 4. OS Lifecycle & Crash-Free Reliability
-* **Renderer-Death Recovery:** Automatically detects WebView renderer crashes (`onRenderProcessGone`), discards the dead instance cleanly, and recreates a fresh WebView session (`webViewGeneration`).
-* **Foreground Service Safety:** Synchronously invokes `startForeground()` immediately upon service start to prevent Android 12+ `ForegroundServiceDidNotStartInTimeException` crashes.
-* **Throttled Updates:** Throttles download progress ticks and foreground notification intervals to `1,000ms` (1 second) to eliminate main-thread flooding and prevent UI ANRs/freezes.
+### 4. Library & Player
+* Downloads list with thumbnails, type filters, open, share, remove, delete file, and clear finished.
+* Built-in Media3 (ExoPlayer) player for video and audio, including HLS `.ts` output; formats it can't decode are handed to another app.
+
+### 5. Settings
+* Simultaneous downloads, Wi-Fi only, light/dark/system theme, clear browsing data.
+
+---
+
+## ⚠️ Not supported yet
+DASH downloads · fMP4 / AES-128 HLS · muxing separate HLS audio · converting `.ts` to `.mp4` · multi-connection downloads · password-protected private folder · SD-card location picker · `blob:`/MediaSource-only players.
 
 ---
 
@@ -34,8 +49,11 @@
 * **Language:** Kotlin 2.0+
 * **UI Toolkit:** Jetpack Compose & Material 3
 * **Concurrency:** Kotlin Coroutines & StateFlow
-* **Networking:** OkHttp & `HttpURLConnection` with connection pooling and range headers
-* **Storage:** Scoped Storage via `MediaStore` & `SharedPreferences` persistence
+* **Networking:** `HttpURLConnection` with range requests
+* **Playback:** AndroidX Media3 ExoPlayer
+* **Storage:** Scoped Storage via `MediaStore`, `SharedPreferences` persistence
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
 
 ---
 
@@ -51,4 +69,8 @@
 3. **Install Debug Build:**
    ```bash
    ./gradlew installDebug
+   ```
+4. **Unit tests:**
+   ```bash
+   ./gradlew testDebugUnitTest
    ```

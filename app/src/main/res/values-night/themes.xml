@@ -1,0 +1,8 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.Fetch" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#8AA9FF</item>
+        <item name="android:windowBackground">#111316</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>
