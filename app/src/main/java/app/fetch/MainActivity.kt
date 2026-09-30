@@ -78,6 +78,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -102,6 +103,7 @@ import app.fetch.download.TransferPhase
 import app.fetch.download.StreamType
 import app.fetch.download.asReadableBytes
 import app.fetch.download.progress
+import java.net.URLEncoder
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
@@ -146,7 +148,7 @@ private fun FetchApp() {
             when (tab) {
                 0 -> BrowserScreen(
                     candidates = candidates,
-                    onDetected = { DownloadCoordinator.detect(it) },
+                    onDetected = { candidate, sessionId -> DownloadCoordinator.detect(candidate, sessionId) },
                     onOpenDownloadSheet = { showDownloadSheet = true }
                 )
                 1 -> DownloadsScreen(downloads)
@@ -178,7 +180,7 @@ data class TabItem(
 @Composable
 private fun BrowserScreen(
     candidates: List<MediaCandidate>,
-    onDetected: (MediaCandidate) -> Unit,
+    onDetected: (MediaCandidate, Long) -> Unit,
     onOpenDownloadSheet: () -> Unit
 ) {
     var tabs by remember { mutableStateOf(listOf(TabItem())) }
@@ -487,11 +489,16 @@ private fun BrowserEmptyState(onOpen: (String) -> Unit) {
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-private fun BrowserView(url: String, onTitle: (String) -> Unit, onDetected: (MediaCandidate) -> Unit) {
+private fun BrowserView(url: String, onTitle: (String) -> Unit, onDetected: (MediaCandidate, Long) -> Unit) {
     var webViewGeneration by remember { mutableIntStateOf(0) }
     val webViewBundle = remember { Bundle() }
     val lastRequestedUrl = remember { AtomicReference<String?>(null) }
     val isRendererGone = remember { AtomicBoolean(false) }
+    val currentSessionId = remember { mutableLongStateOf(DownloadCoordinator.startNewSession(url)) }
+
+    LaunchedEffect(url) {
+        currentSessionId.longValue = DownloadCoordinator.startNewSession(url)
+    }
 
     key(webViewGeneration) {
         AndroidView(factory = { context ->
@@ -500,17 +507,38 @@ private fun BrowserView(url: String, onTitle: (String) -> Unit, onDetected: (Med
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 settings.mediaPlaybackRequiresUserGesture = true
-                webChromeClient = WebChromeClient()
+                webChromeClient = object : WebChromeClient() {
+                    override fun onReceivedTitle(view: WebView?, title: String?) {
+                        if (!title.isNullOrBlank()) onTitle(title)
+                    }
+                }
                 webViewClient = object : WebViewClient() {
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                         if (!url.isNullOrBlank()) onTitle(url.removePrefix("https://").removePrefix("http://").substringBefore('/'))
+                    }
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        view?.evaluateJavascript(
+                            """
+                            (() => {
+                                const og = document.querySelector('meta[property="og:title"]')?.content;
+                                const twitter = document.querySelector('meta[name="twitter:title"]')?.content;
+                                return og || twitter || document.title || "";
+                            })()
+                            """.trimIndent()
+                        ) { result ->
+                            if (!result.isNullOrBlank() && result != "\"\"") {
+                                val cleaned = result.trim('"')
+                                if (cleaned.isNotBlank()) onTitle(cleaned)
+                            }
+                        }
                     }
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val urlStr = request?.url?.toString() ?: return super.shouldInterceptRequest(view, request)
                         if (isCandidateUrl(urlStr)) {
                             val acceptHeader = request.requestHeaders?.get("Accept")
                             val defaultTitle = urlStr.substringBefore('?').substringAfterLast('/').ifBlank { "Detected media" }
-                            onDetected(browserCandidate(urlStr, defaultTitle, acceptHeader, "Fetch/1.0 Android", url))
+                            onDetected(browserCandidate(urlStr, defaultTitle, acceptHeader, "Fetch/1.0 Android", url), currentSessionId.longValue)
                         }
                         return super.shouldInterceptRequest(view, request)
                     }
@@ -522,7 +550,7 @@ private fun BrowserView(url: String, onTitle: (String) -> Unit, onDetected: (Med
                 }
                 setDownloadListener(DownloadListener { detectedUrl, userAgent, contentDisposition, mimeType, _ ->
                     val title = Regex("filename=\\\"?([^;\\\"]+)").find(contentDisposition.orEmpty())?.groupValues?.getOrNull(1) ?: detectedUrl.substringBefore('?').substringAfterLast('/').ifBlank { "media" }
-                    onDetected(browserCandidate(detectedUrl, title, mimeType, userAgent, url))
+                    onDetected(browserCandidate(detectedUrl, title, mimeType, userAgent, url), currentSessionId.longValue)
                 })
                 if (!webViewBundle.isEmpty && !isRendererGone.get()) {
                     restoreState(webViewBundle)
@@ -533,6 +561,7 @@ private fun BrowserView(url: String, onTitle: (String) -> Unit, onDetected: (Med
             }
         }, update = { webView ->
             if (url.isNotBlank() && lastRequestedUrl.getAndSet(url) != url) {
+                currentSessionId.longValue = DownloadCoordinator.startNewSession(url)
                 webView.loadUrl(url)
             }
         }, modifier = Modifier.fillMaxSize(),
@@ -626,7 +655,19 @@ private fun SettingsScreen() {
 @Composable
 private fun SettingLine(title: String, summary: String) { Column(Modifier.fillMaxWidth().clickable { }.padding(horizontal = 16.dp, vertical = 18.dp)) { Text(title, fontWeight = FontWeight.Medium); Spacer(Modifier.height(4.dp)); Text(summary, color = Color(0xFF626873), fontSize = 14.sp) }; HorizontalDivider(color = Color(0xFFE8E9EC)) }
 
-private fun normalizeUrl(input: String): String = input.trim().let { if (it.startsWith("http://") || it.startsWith("https://")) it else "https://$it" }
+private fun normalizeUrl(input: String): String {
+    val trimmed = input.trim()
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+        return trimmed
+    }
+    val isDomain = !trimmed.contains(' ') && (trimmed.contains('.') || trimmed == "localhost" || trimmed.contains(":"))
+    return if (isDomain) {
+        "https://$trimmed"
+    } else {
+        val encoded = URLEncoder.encode(trimmed, "UTF-8")
+        "https://duckduckgo.com/?q=$encoded"
+    }
+}
 
 private fun browserCandidate(url: String, title: String, mime: String?, userAgent: String?, referer: String?): MediaCandidate {
     val headers = buildMap {

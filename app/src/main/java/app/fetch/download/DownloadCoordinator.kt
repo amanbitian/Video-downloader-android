@@ -14,6 +14,7 @@ import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLDecoder
+import java.util.concurrent.atomic.AtomicLong
 
 /** Process-local UI state. Files are kept as .part files, so an interrupted transfer is never exposed as media. */
 object DownloadCoordinator {
@@ -42,7 +43,20 @@ object DownloadCoordinator {
         requestPersist(immediate = true)
     }
 
-    fun detect(candidate: MediaCandidate) {
+    private val sessionCounter = AtomicLong(0)
+    private val activeSessionId = AtomicLong(0)
+
+    fun startNewSession(url: String): Long {
+        val id = sessionCounter.incrementAndGet()
+        activeSessionId.set(id)
+        synchronized(stateLock) {
+            mutableCandidates.value = emptyList()
+        }
+        return id
+    }
+
+    fun detect(candidate: MediaCandidate, sessionId: Long) {
+        if (sessionId != activeSessionId.get()) return
         if (!isLikelyMedia(candidate.url, candidate.mimeType)) return
         val isNew = synchronized(stateLock) {
             val key = candidateKey(candidate)
@@ -55,9 +69,15 @@ object DownloadCoordinator {
         if (isNew && candidate.streamType == StreamType.HLS) {
             scope.launch {
                 val variants = runCatching { HlsResolver.resolve(candidate) }.getOrDefault(emptyList())
-                if (variants.isNotEmpty()) updateCandidate(candidate.url) { it.copy(variants = variants) }
+                if (sessionId == activeSessionId.get() && variants.isNotEmpty()) {
+                    updateCandidate(candidate.url) { it.copy(variants = variants) }
+                }
             }
         }
+    }
+
+    fun detect(candidate: MediaCandidate) {
+        detect(candidate, activeSessionId.get())
     }
 
     fun dismissCandidate(url: String) {
