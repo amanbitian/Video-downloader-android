@@ -5,6 +5,7 @@ import android.content.Intent
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -45,8 +46,10 @@ object DownloadCoordinator {
 
     private val sessionCounter = AtomicLong(0)
     private val activeSessionId = AtomicLong(0)
+    private var resolverJob: Job? = null
 
     fun startNewSession(url: String): Long {
+        resolverJob?.cancel()
         val id = sessionCounter.incrementAndGet()
         activeSessionId.set(id)
         synchronized(stateLock) {
@@ -67,7 +70,7 @@ object DownloadCoordinator {
             }
         }
         if (isNew && candidate.streamType == StreamType.HLS) {
-            scope.launch {
+            resolverJob = scope.launch {
                 val variants = runCatching { HlsResolver.resolve(candidate) }.getOrDefault(emptyList())
                 if (sessionId == activeSessionId.get() && variants.isNotEmpty()) {
                     updateCandidate(candidate.url) { it.copy(variants = variants) }
@@ -130,10 +133,13 @@ object DownloadCoordinator {
         return listOf(".mp4", ".webm", ".mkv", ".mov", ".mp3", ".m4a", ".m3u8", ".mpd", "video/", "audio/", "application/dash+xml").any(value::contains)
     }
 
-    private fun fileSafeTitle(value: String): String = value
-        .replace(Regex("[\\\\/:*?\"<>|]"), "_")
-        .take(90)
-        .ifBlank { "download" }
+    private fun fileSafeTitle(value: String): String {
+        val cleaned = if (value.contains("m2-res_") || value.startsWith("m2-")) "Video" else value
+        return cleaned
+            .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .take(90)
+            .ifBlank { "download" }
+    }
 
     private fun updateCandidate(url: String, transform: (MediaCandidate) -> MediaCandidate) {
         synchronized(stateLock) { mutableCandidates.value = mutableCandidates.value.map { if (it.url == url) transform(it) else it } }
