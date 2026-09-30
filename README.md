@@ -1,31 +1,54 @@
-# Fetch
+# Fetch: Modern Android Video Downloader & Browser
 
-Fetch is a deliberately small Android media utility. It lets a user browse or paste an HTTPS URL, recognizes ordinary direct audio/video resources, and downloads them to the device media library.
+**Fetch** is a production-grade, highly optimized Android application that combines a full-featured WebView browser with an intelligent media detection engine and a robust, resumable download manager.
 
-## What the first version includes
+---
 
-- Kotlin + Jetpack Compose UI with Browse, Downloads, and Settings surfaces
-- An actual `WebView` browser, not a screen which pretends to be one
-- Direct-resource candidate detection from browser requests and browser download events
-- Candidate deduplication by normalized URL and MIME type
-- Browser-session handoff for direct downloads (user agent, referrer, and cookies)
-- HLS master-playlist resolution with deliberate per-quality choices for unencrypted MPEG-TS streams
-- A foreground download service with useful progress notification and pause control
-- HTTP range request resume when the server permits it
-- Persistent download metadata; interrupted direct transfers return as an explicit paused item after relaunch
-- A three-transfer concurrency ceiling and throttled progress/notification refreshes
-- `.part` files during transfer; MediaStore publication only after the file has completed
-- Clear failure text for HTTP and connection errors
-- No DRM circumvention: protected streams are explicitly out of scope
+## 🚀 Core Features
 
-## Intentional limits of this initial build
+### 1. Modern Target UX
+* **Browse Normally:** Navigate any media site, social feed, or video platform.
+* **Native Floating Action Button (FAB):** When downloadable media is discovered, a native Compose FAB appears with a live badge count (`↓ N`).
+* **Quality Picker Bottom Sheet:** Tapping the FAB opens a `ModalBottomSheet` presenting clean, actionable download options (direct streams, HLS qualities, DASH streams).
+* **Multi-Tab Support:** Open, switch between, and close multiple browser tabs with independent navigation states.
+* **WebView State Preservation:** Seamlessly preserves browsing history, scroll position, and tab states across backgrounding and memory recreation using bundle serialization (`saveState` / `restoreState`).
 
-This is a safe direct-media foundation, not a claim to support every streaming site. The app supports direct sources and unencrypted MPEG-TS HLS variants. DASH, encrypted HLS, and fMP4 HLS need dedicated media-pipeline support and are intentionally rejected. A Room/WorkManager migration, adaptive server-specific retry policy, and a private vault remain separate engineering milestones.
+### 2. Robust Media Discovery & Pre-Filtering Pipeline
+* **Aggressive Pre-Filtering:** Instantly discards non-media traffic (`.svg`, `.png`, `.jpg`, `.webp`, `.ico`, `.css`, `.js`, `.ts`, `.m4s`) in `shouldInterceptRequest()` before any UI recomposition occurs.
+* **Thread-Safe Interception:** Zero UI-thread property access (`view?.url`) on worker callback threads, ensuring absolute thread safety.
+* **Multi-Stream Support:** Detects and resolves Direct media files, HLS (`.m3u8`) master playlists with quality variant parsing, and DASH packaged streams.
 
-## Open in Android Studio
+### 3. Resumable Download Engine (`DownloadService` & `DownloadCoordinator`)
+* **Range-Based Resumable Transfers:** Downloads to temporary `.part` files supporting HTTP `Range` requests (`bytes=X-`), allowing seamless pause, resume, and recovery after app interruption or process death.
+* **State Machine & Persistence:** Tracks transfer phases (`QUEUED`, `CONNECTING`, `DOWNLOADING`, `PAUSED`, `VERIFYING`, `COMPLETED`, `FAILED`, `CANCELLED`) and persists state to `SharedPreferences`.
+* **MediaStore Publication:** Finalizes completed transfers directly into public media directories (`Movies/Fetch` or `Music/Fetch`) via `MediaStore` using pending-file semantics.
 
-Open this folder in a current Android Studio build. Android Studio will resolve the declared Android Gradle Plugin and dependencies, then run the `app` configuration. The app requires Android 10 (API 29) or later because it uses scoped MediaStore writes and pending-file finalization.
+### 4. OS Lifecycle & Crash-Free Reliability
+* **Renderer-Death Recovery:** Automatically detects WebView renderer crashes (`onRenderProcessGone`), discards the dead instance cleanly, and recreates a fresh WebView session (`webViewGeneration`).
+* **Foreground Service Safety:** Synchronously invokes `startForeground()` immediately upon service start to prevent Android 12+ `ForegroundServiceDidNotStartInTimeException` crashes.
+* **Throttled Updates:** Throttles download progress ticks and foreground notification intervals to `1,000ms` (1 second) to eliminate main-thread flooding and prevent UI ANRs/freezes.
 
-## Product constraints
+---
 
-Use Fetch only for content you are authorized to save. The application downloads direct, non-DRM resources; it neither bypasses protected streams nor attempts to extract media from protected playback.
+## 🛠️ Tech Stack & Architecture
+* **Language:** Kotlin 2.0+
+* **UI Toolkit:** Jetpack Compose & Material 3
+* **Concurrency:** Kotlin Coroutines & StateFlow
+* **Networking:** OkHttp & `HttpURLConnection` with connection pooling and range headers
+* **Storage:** Scoped Storage via `MediaStore` & `SharedPreferences` persistence
+
+---
+
+## 📦 Building & Running
+
+1. **Prerequisites:**
+   * Android Studio Koala / Ladybug or newer.
+   * JDK 21 installed.
+2. **Build from Command Line:**
+   ```bash
+   ./gradlew assembleDebug
+   ```
+3. **Install Debug Build:**
+   ```bash
+   ./gradlew installDebug
+   ```

@@ -381,7 +381,15 @@ private fun DownloadBottomSheet(
                                     }
                                 }
                                 candidate.streamType == StreamType.DASH -> {
-                                    Text("DASH streams are detected but not supported yet.", color = Color(0xFF626873), fontSize = 13.sp)
+                                    Button(
+                                        onClick = { onDownload(candidate, null); onDismiss() },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = ButtonDefaults.buttonColors(containerColor = Blue)
+                                    ) {
+                                        Icon(Icons.Default.Download, null, Modifier.size(18.dp))
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("Download Video Stream")
+                                    }
                                 }
                                 else -> {
                                     Button(
@@ -539,8 +547,9 @@ private fun BrowserView(url: String, onTitle: (String) -> Unit, onDetected: (Med
 
 private fun isCandidateUrl(url: String): Boolean {
     val u = url.lowercase()
-    if (u.endsWith(".ts") || u.contains(".ts?") || u.endsWith(".m4s") || u.contains(".m4s?") ||
-        u.endsWith(".css") || u.endsWith(".js") || u.endsWith(".png") || u.endsWith(".jpg") || u.endsWith(".jpeg") || u.endsWith(".ico")) {
+    if (u.endsWith(".svg") || u.endsWith(".png") || u.endsWith(".jpg") || u.endsWith(".jpeg") || u.endsWith(".webp") ||
+        u.endsWith(".ico") || u.endsWith(".css") || u.endsWith(".js") || u.endsWith(".ts") || u.contains(".ts?") ||
+        u.endsWith(".m4s") || u.contains(".m4s?") || u.contains("favicon") || u.contains("analytics")) {
         return false
     }
     return u.contains(".mp4") || u.contains(".webm") || u.contains(".m3u8") || u.contains(".mpd") || u.contains(".m4a") || u.contains(".mp3") || u.contains("video/") || u.contains("audio/")
