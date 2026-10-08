@@ -7,6 +7,9 @@ package app.fetch.browser
  */
 object PageMediaScanner {
     const val MAX_ELEMENTS = 30
+    private const val MAX_INLINE_URLS = 150
+    /** Characters of inline script read per page; player configs sit well within it, huge app bundles are cut off. */
+    private const val INLINE_TEXT_LIMIT = 3_000_000
 
     val SCRIPT = """
         (() => {
@@ -45,13 +48,30 @@ object PageMediaScanner {
             };
           });
           window.__fetchMediaNext = next;
+          // Media URLs written into inline scripts (player configs list every quality, the player fetches one).
+          // Re-read only when scripts were added; JSON escapes of "/" and "&" are undone first.
+          const inline = (() => {
+            const scripts = Array.from(document.scripts).filter(s => !s.src);
+            const cached = window.__fetchInline;
+            if (cached && cached.n === scripts.length) return cached.urls;
+            let text = '';
+            for (const s of scripts) { if (text.length > ${INLINE_TEXT_LIMIT}) break; text += s.textContent + '\n'; }
+            text = text.replace(/\\u002[fF]/g, '/').replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
+            const re = /https?:\/\/[^\s"'<>\\]+?\.(?:m3u8|mpd|mp4|m4v|webm|mov)(?:\?[^\s"'<>\\]*)?(?=["'\s<>\\,;)]|${'$'})/gi;
+            const found = new Set();
+            let m;
+            while ((m = re.exec(text)) && found.size < ${MAX_INLINE_URLS}) found.add(m[0]);
+            const urls = Array.from(found);
+            window.__fetchInline = { n: scripts.length, urls: urls };
+            return urls;
+          })();
           return JSON.stringify({
             url: location.href, title: document.title,
             ogTitle: meta('meta[property="og:title"]') || meta('meta[name="twitter:title"]'),
             site: meta('meta[property="og:site_name"]'),
             image: abs(meta('meta[property="og:image"]') || meta('meta[name="twitter:image"]')),
             ogVideos: metas('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"], meta[name="twitter:player:stream"]'),
-            ld: ld, videos: videos, vw: window.innerWidth, vh: window.innerHeight, pw: document.documentElement.scrollWidth
+            ld: ld, videos: videos, inline: inline, vw: window.innerWidth, vh: window.innerHeight, pw: document.documentElement.scrollWidth
           });
         })()
     """.trimIndent()

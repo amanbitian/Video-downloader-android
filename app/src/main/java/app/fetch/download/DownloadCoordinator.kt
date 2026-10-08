@@ -104,6 +104,8 @@ object DownloadCoordinator {
     /** Representation/segment URLs owned by a manifest resolved on this page. Guarded by [stateLock]. */
     private val claimedPaths = HashSet<String>()
     private val claimedPrefixes = HashSet<String>()
+    /** Paths of other-quality streams/files of a video on this page, looked up or folded into its entry. Guarded by [stateLock]. */
+    private val qualityPaths = HashSet<String>()
     private var pageTitle: String? = null
     private var pageThumbnail: String? = null
     private var pageHost: String? = null
@@ -122,6 +124,7 @@ object DownloadCoordinator {
         probedUrls.clear()
         claimedPaths.clear()
         claimedPrefixes.clear()
+        qualityPaths.clear()
         pageTitle = null; pageThumbnail = null; pageHost = null; snapshot = null; sliceAudio = null
         raw = emptyList()
         activeSessionId = ++sessionCounter
@@ -135,6 +138,8 @@ object DownloadCoordinator {
         if (isImage(candidate.url, candidate.mimeType)) return
         if (!candidate.explicit && AdMediaClassifier.isAdUrl(candidate.url)) return
         if (!candidate.explicit && isClaimed(candidate.url)) return
+        // Another quality of a video already listed (looked up from the page, or folded in): its entry has it.
+        if (!candidate.explicit && candidate.streamType != StreamType.DIRECT && synchronized(stateLock) { pathOf(candidate.url) in qualityPaths }) return
         if (!candidate.explicit && !isLikelyMedia(candidate.url, candidate.mimeType)) {
             if (candidate.probe) launchProbe(candidate, sessionId, adoptOnlyIfMedia = true)
             return
@@ -148,7 +153,7 @@ object DownloadCoordinator {
                 return
             }
         }
-        val isNew = commitIfCurrent(sessionId) { addLocked(withPageInfo(candidate)) } == true
+        val isNew = commitIfCurrent(sessionId) { addLocked(withPageInfo(candidate)).also { if (it) findQualitySiblingsLocked(sessionId) } } == true
         if (candidate.explicit) mutableSheetRequests.tryEmit(Unit)
         if (!isNew) return
         when (candidate.streamType) {
@@ -177,6 +182,7 @@ object DownloadCoordinator {
             snapshot = pageSnapshot
             pageHost = UrlUtils.host(pageSnapshot.pageUrl).ifBlank { pageHost }
             raw = raw
+            findQualitySiblingsLocked(sessionId)
         }
     }
 
@@ -287,10 +293,20 @@ object DownloadCoordinator {
         commitIfCurrent(sessionId) {
             claimedPaths += resolved.claimedPaths
             claimedPrefixes += resolved.claimedPrefixes
+            // One stream per quality (players load one): a stream of a video already listed adds its qualities to that entry.
+            if (resolved.isAd || !absorbIntoFamilyLocked(candidate.url, resolved)) {
+                raw = raw.map { existing ->
+                    if (existing.url != candidate.url) return@map existing
+                    // Qualities looked up from the page may have arrived first; keep them.
+                    val variants = mergeQualities(existing.variants, resolved.variants)
+                    existing.copy(variants = variants, resolved = true, note = resolved.note.takeIf { variants.isEmpty() },
+                        durationSeconds = resolved.durationSeconds ?: existing.durationSeconds, isAd = resolved.isAd)
+                }
+            }
             // Sniffed copies of this manifest's own representations/segments are not separate videos.
             raw = raw.mapNotNull { existing ->
                 when {
-                    existing.url == candidate.url -> existing.copy(variants = resolved.variants, resolved = true, note = resolved.note, durationSeconds = resolved.durationSeconds, isAd = resolved.isAd)
+                    existing.url == candidate.url -> existing
                     existing.explicit -> existing
                     existing.groupKey != null -> existing.copy(variants = existing.variants.filterNot { isClaimedLocked(it.url) }).takeIf { it.variants.isNotEmpty() }
                     isClaimedLocked(existing.url) -> null
@@ -299,6 +315,95 @@ object DownloadCoordinator {
             }
         }
     }
+
+    /**
+     * Players fetch one quality, while the page's script often lists them all as separate streams or files
+     * (".../240P_400K_x.mp4/master.m3u8", ".../1080P_4000K_x.mp4/master.m3u8"). Inline URLs of the same family as a
+     * detected video are looked up once each and filed under that video as more qualities.
+     */
+    private fun findQualitySiblingsLocked(sessionId: Long) {
+        val inline = snapshot?.inlineUrls.orEmpty()
+        if (inline.isEmpty()) return
+        val families = inline.mapNotNull { url -> MediaGrouping.family(url)?.let { url to it } }
+        if (families.isEmpty()) return
+        val present = raw.flatMapTo(HashSet()) { c -> c.variants.map { pathOf(it.url) } + pathOf(c.url) }
+        raw.filter { !it.explicit && !it.isAd && (it.streamType != StreamType.DIRECT || it.groupKey != null) }.forEach { target ->
+            val family = MediaGrouping.family(target.url) ?: return@forEach
+            families.forEach { (url, urlFamily) ->
+                val path = pathOf(url)
+                if (urlFamily != family || streamTypeOf(url) != target.streamType || path in present || !qualityPaths.add(path)) return@forEach
+                lookUpSibling(target, url, sessionId)
+            }
+        }
+    }
+
+    private fun lookUpSibling(target: MediaCandidate, url: String, sessionId: Long) {
+        val sibling = target.copy(url = url, variants = emptyList(), sliceFetch = false, resolved = false, note = null, sizeBytes = null)
+        if (target.streamType == StreamType.DIRECT) {
+            // Probed like any quality-named file and filed under the target's group.
+            target.groupKey?.let { detectQuality(sibling, it, sessionId) }
+            return
+        }
+        scope.launch(sessionJob) {
+            val resolved = runCatching { streamResolver(sibling) }.getOrNull()
+            commitIfCurrent(sessionId) {
+                if (resolved == null || resolved.isAd || resolved.variants.isEmpty()) {
+                    // Not usable; if the player fetches it later it is judged on its own.
+                    qualityPaths -= pathOf(url)
+                    return@commitIfCurrent
+                }
+                claimedPaths += resolved.claimedPaths
+                claimedPrefixes += resolved.claimedPrefixes
+                absorbIntoFamilyLocked(url, resolved)
+            }
+        }
+    }
+
+    /**
+     * Files the resolved stream at [url] under another listed stream of the same video (same [MediaGrouping.family]),
+     * removing its own entry if it has one. Returns false when no such entry exists.
+     */
+    private fun absorbIntoFamilyLocked(url: String, resolved: ResolvedStream): Boolean {
+        val family = MediaGrouping.family(url) ?: return false
+        val path = pathOf(url)
+        val host = raw.firstOrNull {
+            pathOf(it.url) != path && !it.explicit && !it.isAd && it.streamType != StreamType.DIRECT && MediaGrouping.family(it.url) == family
+        } ?: return false
+        val own = raw.firstOrNull { pathOf(it.url) == path && it.groupKey == null }
+        val variants = mergeQualities(host.variants, resolved.variants)
+        raw = raw.mapNotNull {
+            when {
+                it === host -> (if (own != null) it.mergedWith(own) else it).copy(
+                    variants = variants, note = it.note.takeIf { variants.isEmpty() },
+                    durationSeconds = it.durationSeconds ?: resolved.durationSeconds,
+                )
+                it === own -> null
+                else -> it
+            }
+        }
+        qualityPaths += path
+        return true
+    }
+
+    /** Qualities from several sources of one video: one per resolution (the first seen wins a tie), best first. */
+    private fun mergeQualities(current: List<MediaVariant>, added: List<MediaVariant>): List<MediaVariant> {
+        if (current.isEmpty()) return added
+        val all = (current + added).distinctBy { Triple(it.url, it.videoKey, it.audioKey) }
+        val (known, unknown) = all.partition { it.height != null }
+        return (known.distinctBy { it.height } + unknown)
+            .sortedWith(compareByDescending<MediaVariant> { it.height ?: 0 }.thenByDescending { it.bitrate ?: 0 })
+    }
+
+    private fun streamTypeOf(url: String): StreamType {
+        val lowered = url.substringBefore('?').lowercase()
+        return when {
+            lowered.endsWith(".m3u8") -> StreamType.HLS
+            lowered.endsWith(".mpd") -> StreamType.DASH
+            else -> StreamType.DIRECT
+        }
+    }
+
+    private fun pathOf(url: String) = url.substringBefore('#').substringBefore('?')
 
     /** One quality of an adaptive or multi-quality video: probe it, then file it under its group. */
     private fun detectQuality(candidate: MediaCandidate, stem: String, sessionId: Long) {
@@ -338,6 +443,7 @@ object DownloadCoordinator {
                 }
                 raw = if (existing == null) (others + group).takeLast(MAX_CANDIDATES)
                 else others.map { if (it === existing) group else it }
+                findQualitySiblingsLocked(sessionId)
             }
         }
     }

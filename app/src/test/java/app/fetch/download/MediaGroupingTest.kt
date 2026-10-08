@@ -2,6 +2,7 @@ package app.fetch.download
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -19,6 +20,16 @@ class MediaGroupingTest {
     @Test fun `files without a quality marker are not grouped`() {
         assertNull(MediaGrouping.stem("https://cdn.example.com/v/clip.mp4"))
         assertNull(MediaGrouping.stem("https://cdn.example.com/2024/clip_2024.mp4"))
+    }
+
+    @Test fun `per-quality streams of one video share a family across hosts and bitrates`() {
+        val low = MediaGrouping.family("https://a.cdn.example/hls/videos/2024/01/123/240P_400K_123.mp4/master.m3u8?hash=1")
+        val high = MediaGrouping.family("https://b.cdn.example/hls/videos/2024/01/123/1080P_4000K_123.mp4/master.m3u8?hash=2")
+        assertEquals(low, high)
+        assertNotEquals(low, MediaGrouping.family("https://a.cdn.example/hls/videos/2024/01/999/1080P_4000K_999.mp4/master.m3u8"))
+        assertNotEquals(low, MediaGrouping.family("https://a.cdn.example/videos/2024/01/123/1080P_4000K_123.mp4"))
+        assertEquals(MediaGrouping.family("https://x.example/v/clip_480p.mp4"), MediaGrouping.family("https://y.example/v/clip_1080p.mp4"))
+        assertNull(MediaGrouping.family("https://x.example/v/2024/clip_4000k.mp4"))
     }
 
     @Test fun `heights are read from the name`() {

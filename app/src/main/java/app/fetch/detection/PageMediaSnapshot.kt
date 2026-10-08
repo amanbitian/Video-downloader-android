@@ -14,6 +14,8 @@ data class PageMediaSnapshot(
     val ogVideos: List<String>,
     val structuredVideos: List<StructuredVideo>,
     val elements: List<DomMedia>,
+    /** Media URLs written into the page's inline scripts, e.g. a player config listing every quality. */
+    val inlineUrls: List<String> = emptyList(),
     val viewportWidth: Double,
     val viewportHeight: Double,
     val pageWidth: Double,
@@ -70,6 +72,7 @@ data class PageMediaSnapshot(
                         contextWords = v.optJSONArray("context").strings().flatMap(::words),
                     )
                 },
+                inlineUrls = root.optJSONArray("inline").strings().mapNotNull { it.httpOrNull() }.distinct(),
                 viewportWidth = root.optDouble("vw", 0.0), viewportHeight = root.optDouble("vh", 0.0), pageWidth = root.optDouble("pw", 0.0),
             )
         }.getOrNull()

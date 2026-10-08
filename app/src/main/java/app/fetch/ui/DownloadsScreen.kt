@@ -119,7 +119,7 @@ fun DownloadsScreen(downloads: List<DownloadItem>, onBack: () -> Unit) {
                     item = item,
                     kind = kinds[item.id] ?: MediaKind.OTHER,
                     onCommand = { action -> DownloadCoordinator.command(context, action, item.id) },
-                    onOpen = { MediaActions.open(context, item) },
+                    onOpen = { MediaActions.open(context, item, visible) },
                     onShare = { MediaActions.share(context, item) },
                     onRemove = { DownloadCoordinator.remove(context, item.id, deleteFile = false) },
                     onDelete = { pendingDelete = item },

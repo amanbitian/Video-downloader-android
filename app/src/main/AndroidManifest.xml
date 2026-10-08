@@ -36,11 +36,27 @@
                 <data android:scheme="https" />
             </intent-filter>
         </activity>
+        <!-- Own task so picture-in-picture floats independently of the browser; handles every screen change itself. -->
         <activity
             android:name=".player.PlayerActivity"
-            android:exported="false"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
-            android:theme="@style/Theme.Fetch.Player" />
+            android:exported="true"
+            android:label="Fetch Player"
+            android:launchMode="singleTask"
+            android:taskAffinity="app.fetch.player"
+            android:supportsPictureInPicture="true"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale"
+            android:theme="@style/Theme.Fetch.Player">
+            <!-- "Open with Fetch Player" for any video or audio file in other apps. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
+            </intent-filter>
+        </activity>
         <service
             android:name=".download.DownloadService"
             android:foregroundServiceType="dataSync"

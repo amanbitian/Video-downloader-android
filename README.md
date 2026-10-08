@@ -29,6 +29,7 @@ Fetch answers *"which video is this page about?"*, not *"what media did the page
 * **Page isolation:** every page is a session; lookups for the previous page are cancelled, and any result that still arrives is committed only if its session is current (checked under the state lock).
 * Injected script reports `<video>`/`<audio>` sources when they load or start playing.
 * Extension-less media (requests sent with `Range: bytes=0-`) is confirmed with a HEAD / one-byte probe of its `Content-Type`.
+* **Qualities the player didn't load:** players often fetch one quality (on phones, the lowest) while the page's script lists every quality as its own stream or file. Same-video URLs in inline scripts that differ only by quality/bitrate markers (`240P_400K_…` vs `1080P_4000K_…`) are looked up and merged into the one entry, so the sheet offers them all.
 * Any file the page offers as a download (PDF, ZIP, images, …) opens the download sheet directly.
 * Candidates carry the page's real User-Agent, Referer and cookies, are named after the page (`og:title`, with site suffixes like " - YouTube" removed conservatively), and show a thumbnail (`og:image` or the video poster).
 * DRM (`ContentProtection`, HLS keys) and live streams are reported in the sheet up front instead of failing mid-download.
@@ -47,7 +48,12 @@ Fetch answers *"which video is this page about?"*, not *"what media did the page
 
 ### 4. Library & Player
 * Downloads list with thumbnails, type filters, open, share, remove, delete file, and clear finished.
-* Built-in Media3 (ExoPlayer) player for video and audio; formats it can't decode are handed to another app.
+* **MX-style built-in player** (Media3 ExoPlayer) for video and audio; formats it can't decode are handed to another app.
+  * Gestures: swipe left side for brightness, right side for volume, horizontal swipe to seek (with a +/- preview); double-tap left/right to skip 10 s, centre to pause; press and hold for 2× speed; pinch to zoom.
+  * Controls: lock screen, fit / crop / stretch, rotation (auto / landscape / portrait), playback speed 0.25×–3×, audio track and subtitle selection, external subtitle files (SRT / VTT / SSA / TTML), repeat one / all.
+  * Opening a download plays the other finished downloads of the same kind as a playlist (next / previous, auto-advance).
+  * Resumes where you left off ("Start over" to restart), picture-in-picture with a play/pause button, pauses when headphones are unplugged.
+  * Shows up as "Fetch Player" in "Open with" for video and audio files from other apps.
 
 ### 5. Settings
 * Simultaneous downloads, Wi-Fi only, light/dark/system theme, clear browsing data.
@@ -55,7 +61,7 @@ Fetch answers *"which video is this page about?"*, not *"what media did the page
 ---
 
 ## ⚠️ Not supported yet
-DRM-protected or AES-128-encrypted streams · live streams · DASH beyond the first period · AV1 · subtitles · multi-connection downloads · password-protected private folder · SD-card location picker · players whose only source is a `blob:` URL with no fetchable manifest.
+DRM-protected or AES-128-encrypted streams · live streams · DASH beyond the first period · AV1 · downloading subtitle tracks · multi-connection downloads · password-protected private folder · SD-card location picker · players whose only source is a `blob:` URL with no fetchable manifest.
 
 ---
 

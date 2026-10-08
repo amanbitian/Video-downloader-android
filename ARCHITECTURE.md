@@ -94,6 +94,7 @@ navigation → PageSession ─┬─ DOM/metadata scan (0 s, +1 s, +3.5 s, after
 * **Sources:** URL-sniffed sub-resources; the injected `<video>`/`<audio>` script (`FetchMedia` bridge); `Range: bytes=0-` requests confirmed by `MediaProbe`; explicit downloads from `DownloadListener` or the long-press menu.
 * **Headers** replay what the page sent (real User-Agent, Referer, Origin) plus cookies from `CookieManager`.
 * **Resolvers → `ResolvedStream`:** `HlsResolver` (master + media playlists: audio renditions, fMP4 init, byte-range single files) and `DashManifest`/`DashResolver` (templates, timelines, lists, single files, `ContentProtection`, live) turn a manifest into one candidate with a quality per resolution. `AudioPolicy` pairs each quality with an audio track (main role, default/device language, container-compatible codec, bitrate); `Codecs` knows which pairs `MediaMuxer` can combine. Resolvers also return the paths and directories the manifest owns.
+* **Quality siblings (`MediaGrouping.family`, `DownloadCoordinator.findQualitySiblingsLocked`)**: `PageMediaScanner` also returns media URLs found in inline scripts (JSON escapes undone, cached per script count). A URL whose path matches a detected video's apart from quality/bitrate tokens (host ignored) is resolved once and its qualities merged into that video's entry; two such streams sniffed separately are folded together the same way (`absorbIntoFamilyLocked`).
 * **Grouping (`MediaGrouping`, `DownloadCoordinator.detectQuality`)**: sniffed files that a manifest claims are dropped; byte-range (MSE) slices, quality-named files and a `<video>`'s alternative sources are grouped as qualities of one video (with separately fetched audio paired when a player streams it).
 * **Page info:** the page's `og:title` (cleaned by `TitleNormalizer`), `og:image` or poster name and illustrate sniffed candidates.
 
@@ -113,8 +114,10 @@ navigation → PageSession ─┬─ DOM/metadata scan (0 s, +1 s, +3.5 s, after
 * **Publishing:** `MediaFiles` resolves the real MIME type (declared → `Content-Type` → extension) and file name; the file is inserted as pending into the matching MediaStore collection (falling back to Downloads), copied, then published.
 
 ### 6. Library & Player
-* **`MediaActions`**: open (player for audio/video, chooser otherwise), share, delete, thumbnails.
-* **`PlayerActivity`**: Media3 ExoPlayer with position saved across recreation; unplayable formats are handed to another app.
+* **`MediaActions`**: open (player for audio/video with the other finished downloads of the same kind as a playlist, chooser otherwise), share, delete, thumbnails.
+* **`player/PlayerActivity`**: owns the ExoPlayer (10 s seek increments, audio focus, pause on becoming noisy), the queue (from the Downloads list or a `VIEW` intent), resume on `STATE_READY`, window brightness / stream volume, orientation mode, subtitle side-loading via `replaceMediaItem`, and picture-in-picture (aspect-matched params plus a play/pause `RemoteAction`). Runs in its own task (`taskAffinity`, `singleTask`) so PiP floats independently of the browser and a new video replaces the current one via `onNewIntent`. Handles config changes itself, so rotation never interrupts playback. Unplayable formats are handed to another app.
+* **`player/PlayerScreen`**: Compose UI over a controller-less `PlayerView`. One gesture layer handles taps (toggle, double-tap seek, hold for 2×) and drags (seek / brightness / volume, pinch zoom); drags starting in the top/bottom 48dp are left to the system's gestures. Controls auto-hide after 3.5 s; lock mode shows only an unlock button.
+* **`player/PlaybackPositions`**: resume points in SharedPreferences, keyed by a hash of the URI, dropped when a video is finished, capped at 300 entries. **`player/PlayerMath`**: pure seek / level / resume / time-format helpers (unit-tested).
 
 ---
 

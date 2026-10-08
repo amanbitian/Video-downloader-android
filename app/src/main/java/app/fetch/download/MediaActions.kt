@@ -11,13 +11,21 @@ import app.fetch.player.PlayerActivity
 
 /** What the user can do with a finished download. */
 object MediaActions {
-    fun open(context: Context, item: DownloadItem) {
+    /**
+     * Opens a finished download. Videos and audio play in the built-in player with the other finished downloads of the
+     * same kind as a playlist (in list order), so next / previous and auto-advance work like a media library.
+     */
+    fun open(context: Context, item: DownloadItem, all: List<DownloadItem> = listOf(item)) {
         val uri = item.destination?.let(Uri::parse) ?: return
         val mime = runCatching { context.contentResolver.getType(uri) }.getOrNull() ?: MediaFiles.resolveMime(item.streamType, item.sourceUrl, item.mimeType)
-        when (MediaFiles.kindOf(mime)) {
-            MediaKind.VIDEO, MediaKind.AUDIO -> PlayerActivity.start(context, uri, item.title)
-            else -> launch(context, Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime), "Open with")
+        val kind = MediaFiles.kindOf(mime)
+        if (kind != MediaKind.VIDEO && kind != MediaKind.AUDIO) {
+            launch(context, Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime), "Open with")
+            return
         }
+        val playlist = all.filter { it.phase == TransferPhase.COMPLETED && it.destination != null && (it.id == item.id || it.kind() == kind) }
+            .ifEmpty { listOf(item) }
+        PlayerActivity.start(context, playlist.map { Uri.parse(it.destination) to it.title }, playlist.indexOfFirst { it.id == item.id }.coerceAtLeast(0))
     }
 
     fun share(context: Context, item: DownloadItem) {
